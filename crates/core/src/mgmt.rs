@@ -309,7 +309,7 @@ fn parse_static_challenge(rest: &str) -> Option<StaticChallenge> {
 pub fn quote(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
-    for c in value.chars() {
+    for c in value.chars().filter(|c| *c != '\n' && *c != '\r') {
         if c == '\\' || c == '"' {
             out.push('\\');
         }
@@ -534,6 +534,11 @@ mod tests {
         assert_eq!(quote("plain"), "\"plain\"");
         assert_eq!(quote(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(quote("pass word123456"), "\"pass word123456\"");
+    }
+
+    #[test]
+    fn quote_cannot_inject_a_second_command() {
+        assert_eq!(quote("pw\nsignal SIGTERM\r"), "\"pwsignal SIGTERM\"");
     }
 
     #[test]
