@@ -29,6 +29,18 @@
 //! try, and a rejected login when [`SessionOptions::retry_login`] is on. After
 //! the tunnel has been up once, the session keeps trying and asks for a new
 //! code with [`CodeReason::Retry`].
+//!
+//! How commands are sent: one at a time. A command goes to OpenVPN only after
+//! the answer to the one before has arrived in full (see [`Engine::send`]).
+//! OpenVPN on Windows looks for new commands while it is still answering
+//! one, and a command that arrives in that moment is lost while the one being
+//! answered runs a second time. Sent in a row, the password was lost that way
+//! and OpenVPN waited for it for ever.
+//!
+//! How a stuck try ends: a try that makes no progress for
+//! [`SessionOptions::connect_timeout`] ends with [`FailureKind::Timeout`], and
+//! so does an OpenVPN that does not answer a command. The session never stays
+//! on "connecting" without an end.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -55,6 +67,14 @@ pub const CODE_MAX_AGE: Duration = Duration::from_secs(90);
 const MGMT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 /// How long to wait for OpenVPN to exit after asking it to.
 const STOP_TIMEOUT: Duration = Duration::from_secs(8);
+/// How long OpenVPN may take to answer one management command. It answers
+/// from memory, so anything longer means it is stuck.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The same while stopping, where the next command is the one that stops it.
+const REPLY_TIMEOUT_STOPPING: Duration = Duration::from_secs(2);
+/// Extra time on top of the connect timeout, so that OpenVPN, which gets the
+/// same timeout, can report a server that does not answer in its own words.
+const CONNECT_GRACE: Duration = Duration::from_secs(5);
 
 /// Everything a session needs.
 #[derive(Debug, Clone)]
@@ -78,6 +98,8 @@ pub struct SessionOptions {
     pub remote_count: usize,
     /// Changes made to the profile, logged when the session starts.
     pub notes: Vec<String>,
+    /// End a try that makes no progress for this long. Zero waits for ever.
+    pub connect_timeout: Duration,
 }
 
 /// Which way a management line went.
@@ -121,6 +143,9 @@ pub enum FailureKind {
     Unreachable,
     /// A working connection dropped and auto-reconnect is off.
     Dropped,
+    /// A try made no progress for the time in the settings, or OpenVPN
+    /// stopped answering.
+    Timeout,
     /// Anything else, such as OpenVPN not starting.
     Failed,
 }
@@ -134,6 +159,7 @@ impl FailureKind {
             FailureKind::CipherMismatch => "cipher_mismatch",
             FailureKind::Unreachable => "unreachable",
             FailureKind::Dropped => "dropped",
+            FailureKind::Timeout => "timeout",
             FailureKind::Failed => "failed",
         }
     }
@@ -347,8 +373,19 @@ enum Reply {
     StateHistory,
 }
 
+/// A command that waits for its turn.
+struct QueuedCmd {
+    line: Secret,
+    /// The command as it may be shown, with secrets removed.
+    shown: String,
+    kind: Reply,
+}
+
+/// The command OpenVPN is answering.
 struct PendingCmd {
     kind: Reply,
+    shown: String,
+    sent_at: Instant,
     got_end: bool,
     got_reply: bool,
 }
@@ -385,11 +422,20 @@ struct Engine {
     last_problem: Option<String>,
     /// The server address of the current try, from the log.
     current_remote: String,
+    /// The last state OpenVPN reported in the current try.
+    last_state: String,
+    /// When OpenVPN last made progress in a try that is under way. `None`
+    /// while nothing is expected of it: connected, waiting for a code, or
+    /// waiting out a backoff.
+    progress_at: Option<Instant>,
 
     // Per-process state, reset by `run_process`.
     gen: u64,
     writer: Option<TcpStream>,
-    pending: VecDeque<PendingCmd>,
+    /// Commands that wait for the answer to `pending`.
+    queue: VecDeque<QueuedCmd>,
+    /// The one command OpenVPN is answering.
+    pending: Option<PendingCmd>,
     setup_done: bool,
     holds: u32,
     hold_release_at: Option<Instant>,
@@ -439,9 +485,12 @@ impl Engine {
             auth_reason: None,
             last_problem: None,
             current_remote: String::new(),
+            last_state: String::new(),
+            progress_at: None,
             gen: 0,
             writer: None,
-            pending: VecDeque::new(),
+            queue: VecDeque::new(),
+            pending: None,
             setup_done: false,
             holds: 0,
             hold_release_at: None,
@@ -520,7 +569,9 @@ impl Engine {
     fn reset_process_state(&mut self) {
         self.gen += 1;
         self.writer = None;
-        self.pending.clear();
+        self.queue.clear();
+        self.pending = None;
+        self.progress_at = None;
         self.setup_done = false;
         self.holds = 0;
         self.hold_release_at = None;
@@ -542,6 +593,7 @@ impl Engine {
         self.cipher_error = None;
         self.auth_reason = None;
         self.last_problem = None;
+        self.last_state.clear();
     }
 
     fn run_process(&mut self) -> ProcessEnd {
@@ -599,6 +651,7 @@ impl Engine {
             }
         }
         spawn_reader(stream, self.gen, self.tx.clone());
+        self.progress_at = Some(Instant::now());
 
         loop {
             let timeout = self.next_timeout();
@@ -613,7 +666,8 @@ impl Engine {
             match input {
                 Some(Input::Mgmt(g, _)) if g != self.gen => {}
                 Some(Input::Mgmt(_, Some(line))) => {
-                    self.on_line(&line, &mgmt_password, process.as_mut())
+                    self.on_line(&line, &mgmt_password, process.as_mut());
+                    self.pump_queue();
                 }
                 Some(Input::Mgmt(_, None)) => {
                     return self.on_closed(process.as_mut());
@@ -632,6 +686,7 @@ impl Engine {
                     }
                     self.note(LogLevel::Info, "Disconnecting.");
                     self.stopping = true;
+                    self.progress_at = None;
                     self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
                     self.send("signal SIGTERM", Reply::Simple);
                 }
@@ -667,17 +722,67 @@ impl Engine {
 
     fn next_timeout(&self) -> Duration {
         let mut t = Duration::from_millis(500);
-        for d in [self.hold_release_at, self.next_reach_at, self.stop_deadline]
-            .into_iter()
-            .flatten()
+        for d in [
+            self.hold_release_at,
+            self.next_reach_at,
+            self.stop_deadline,
+            self.reply_deadline(),
+            self.progress_deadline(),
+        ]
+        .into_iter()
+        .flatten()
         {
             t = t.min(d.saturating_duration_since(Instant::now()));
         }
         t.max(Duration::from_millis(10))
     }
 
+    /// When the command OpenVPN is answering counts as unanswered.
+    fn reply_deadline(&self) -> Option<Instant> {
+        let limit = if self.stopping {
+            REPLY_TIMEOUT_STOPPING
+        } else {
+            REPLY_TIMEOUT
+        };
+        self.pending.as_ref().map(|p| p.sent_at + limit)
+    }
+
+    /// When the current try counts as stuck.
+    fn progress_deadline(&self) -> Option<Instant> {
+        let limit = self.opts.connect_timeout;
+        if limit.is_zero() || self.stopping || self.connected {
+            return None;
+        }
+        self.progress_at
+            .map(|t| t + limit + CONNECT_GRACE.min(limit))
+    }
+
     fn on_timers(&mut self, _process: &mut dyn VpnProcess) {
         let now_i = Instant::now();
+        if self.reply_deadline().is_some_and(|d| now_i >= d) {
+            let shown = self.pending.take().map(|p| p.shown).unwrap_or_default();
+            if self.stopping {
+                // The next command is the one that stops OpenVPN; send it anyway.
+                self.note(
+                    LogLevel::Warning,
+                    format!("OpenVPN did not answer `{shown}`; going on."),
+                );
+                self.pump_queue();
+            } else {
+                self.give_up(Failure::new(
+                    FailureKind::Timeout,
+                    format!(
+                        "OpenVPN stopped answering: no reply to `{shown}` within {} seconds. \
+                         See `ovpn-otp logs --wire` for what was said before.",
+                        REPLY_TIMEOUT.as_secs()
+                    ),
+                ));
+            }
+        }
+        if self.progress_deadline().is_some_and(|d| now_i >= d) {
+            let failure = self.stalled_failure();
+            self.give_up(failure);
+        }
         if let Some(at) = self.hold_release_at {
             if now_i >= at {
                 self.hold_release_at = None;
@@ -736,35 +841,125 @@ impl Engine {
     /// Let OpenVPN start the next try.
     fn release_hold(&mut self) {
         self.reset_try_state();
+        self.progress_at = Some(Instant::now());
         self.send("hold release", Reply::Simple);
     }
 
+    /// Give a command to OpenVPN when its turn comes.
+    ///
+    /// This is the only way a command may reach the management interface:
+    /// never write to `writer` directly. Commands go out one at a time, each
+    /// after the answer to the one before has arrived in full, because
+    /// OpenVPN on Windows loses a command that arrives while it is still
+    /// answering another (see the module documentation).
     fn send(&mut self, cmd: &str, kind: Reply) {
         let shown = redact_outgoing(cmd);
         self.send_raw(cmd, &shown, kind);
     }
 
     fn send_raw(&mut self, cmd: &str, shown: &str, kind: Reply) {
+        self.queue.push_back(QueuedCmd {
+            line: Secret::new(format!("{}\n", cmd.trim_end_matches(['\r', '\n']))),
+            shown: shown.to_string(),
+            kind,
+        });
+        self.pump_queue();
+    }
+
+    /// Send the next waiting command if OpenVPN is not answering one.
+    fn pump_queue(&mut self) {
+        if self.pending.is_some() {
+            return;
+        }
         let Some(w) = self.writer.as_mut() else {
             return;
         };
-        let mut line = Secret::new(cmd);
-        if !line.expose().ends_with('\n') {
-            line = Secret::new(format!("{}\n", line.expose()));
-        }
-        if w.write_all(line.expose().as_bytes()).is_err() {
+        let Some(next) = self.queue.pop_front() else {
+            return;
+        };
+        if w.write_all(next.line.expose().as_bytes()).is_err() {
+            // The connection is gone; the reader reports it.
+            self.queue.clear();
             return;
         }
-        self.pending.push_back(PendingCmd {
-            kind,
-            got_end: false,
-            got_reply: false,
-        });
         self.emit(Event::Wire {
             at: now(),
             dir: Direction::Out,
-            text: shown.to_string(),
+            text: next.shown.clone(),
         });
+        self.pending = Some(PendingCmd {
+            kind: next.kind,
+            shown: next.shown,
+            sent_at: Instant::now(),
+            got_end: false,
+            got_reply: false,
+        });
+    }
+
+    /// End a try that cannot go on. Before the tunnel was ever up this ends
+    /// the session with `failure`; after, OpenVPN is started again.
+    fn give_up(&mut self, failure: Failure) {
+        if self.stopping {
+            return;
+        }
+        let unused_code = self.sent_code.take().filter(|_| !self.reached_auth);
+        if self.pending_code.is_none() {
+            self.pending_code = unused_code;
+        }
+        self.emit(Event::ConnectFailed {
+            at: now(),
+            failure: failure.clone(),
+        });
+        self.stopping = true;
+        self.progress_at = None;
+        self.hold_release_at = None;
+        if self.ever_connected {
+            self.retry_after_failure = true;
+            self.drop_reason = Some(failure.message);
+        } else {
+            self.end_failure = Some(failure);
+        }
+        self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
+        self.send("signal SIGTERM", Reply::Simple);
+    }
+
+    /// The failure for a try that made no progress for the connect timeout.
+    fn stalled_failure(&self) -> Failure {
+        let server = if self.current_remote.is_empty() {
+            self.opts.remotes.join(", ")
+        } else {
+            self.current_remote.clone()
+        };
+        let to_server = if server.is_empty() {
+            String::new()
+        } else {
+            format!(" to {server}")
+        };
+        let what = match self.last_state.as_str() {
+            "" | "CONNECTING" => {
+                "OpenVPN did not start to connect, and no connection to the server was opened"
+            }
+            "RESOLVE" => "OpenVPN was still looking up the address of the server",
+            "TCP_CONNECT" => "the server did not answer",
+            "WAIT" => "the server took the connection and then said nothing",
+            "AUTH" | "AUTH_PENDING" => "the server did not finish the login",
+            "GET_CONFIG" => "the server did not send its settings",
+            _ => "OpenVPN did not finish setting up the tunnel",
+        };
+        let problem = self
+            .last_problem
+            .as_deref()
+            .map(|p| format!(" OpenVPN said: {p}."))
+            .unwrap_or_default();
+        Failure::new(
+            FailureKind::Timeout,
+            format!(
+                "Gave up connecting{to_server} after {} seconds without progress: {what}.{problem} \
+                 `ovpn-otp logs --wire` shows the conversation with OpenVPN. The wait is the \
+                 setting connect.timeout.",
+                self.opts.connect_timeout.as_secs()
+            ),
+        )
     }
 
     fn setup(&mut self) {
@@ -779,6 +974,13 @@ impl Engine {
 
     fn on_line(&mut self, raw: &str, mgmt_password: &Secret, process: &mut dyn VpnProcess) {
         let line = mgmt::parse_line(raw);
+        // Anything OpenVPN says while a try is under way is progress, except
+        // the byte counters, which tick by themselves.
+        if self.progress_at.is_some()
+            && !matches!(line, Line::Notification(Notification::ByteCount { .. }))
+        {
+            self.progress_at = Some(Instant::now());
+        }
         self.emit(Event::Wire {
             at: now(),
             dir: Direction::In,
@@ -804,25 +1006,22 @@ impl Engine {
                 if let Line::Error(e) = &line {
                     self.note(LogLevel::Warning, format!("OpenVPN said: {e}"));
                 }
-                if let Some(front) = self.pending.front_mut() {
-                    front.got_reply = true;
-                    if front.kind == Reply::Simple
-                        || front.got_end
-                        || matches!(line, Line::Error(_))
-                    {
-                        self.pending.pop_front();
+                if let Some(cmd) = self.pending.as_mut() {
+                    cmd.got_reply = true;
+                    if cmd.kind == Reply::Simple || cmd.got_end || matches!(line, Line::Error(_)) {
+                        self.pending = None;
                     }
                 }
             }
             Line::End => {
-                if let Some(front) = self.pending.front_mut() {
-                    front.got_end = true;
-                    if front.got_reply {
-                        self.pending.pop_front();
+                if let Some(cmd) = self.pending.as_mut() {
+                    cmd.got_end = true;
+                    if cmd.got_reply {
+                        self.pending = None;
                     }
                 }
             }
-            Line::Data(d) => match self.pending.front().map(|p| p.kind) {
+            Line::Data(d) => match self.pending.as_ref().map(|p| p.kind) {
                 Some(Reply::LogHistory) => {
                     if let Some(entry) = mgmt::parse_log(&d) {
                         self.on_log(entry);
@@ -875,6 +1074,7 @@ impl Engine {
                         format!("Waiting {}s before reconnecting.", delay.as_secs()),
                     );
                     self.hold_release_at = Some(Instant::now() + delay);
+                    self.progress_at = None;
                 }
             }
             Notification::State(info) => self.on_state(info),
@@ -902,6 +1102,7 @@ impl Engine {
     }
 
     fn on_state(&mut self, info: StateInfo) {
+        self.last_state = info.name.clone();
         match info.name.as_str() {
             "AUTH" | "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => {
                 // The server answered, and the login goes to it now: the code
@@ -918,6 +1119,7 @@ impl Engine {
                 self.retry_after_failure = false;
                 self.reached_auth = true;
                 self.sent_code = None;
+                self.progress_at = None;
                 if !self.opts.reach.host.trim().is_empty() {
                     self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
                 }
@@ -956,6 +1158,7 @@ impl Engine {
     /// A working connection dropped.
     fn on_drop(&mut self, reason: String) {
         self.sent_code = None;
+        self.progress_at = Some(Instant::now());
         if self.opts.keepalive.auto_reconnect {
             self.emit(Event::Reconnecting {
                 at: now(),
@@ -1145,6 +1348,7 @@ impl Engine {
             Some((code, at)) if at.elapsed() <= CODE_MAX_AGE => Some((code, at)),
             Some(_) => {
                 self.note(LogLevel::Warning, "The code waiting to be used is too old.");
+                self.progress_at = None;
                 self.emit(Event::NeedCode {
                     reason: CodeReason::Expired,
                 });
@@ -1162,10 +1366,13 @@ impl Engine {
             } else {
                 CodeReason::Initial
             };
+            // The wait is for the user now, not for OpenVPN.
+            self.progress_at = None;
             self.emit(Event::NeedCode { reason });
             return;
         };
         self.awaiting_login = None;
+        self.progress_at = Some(Instant::now());
         let user = self.opts.login.username.clone();
         let pass = match &sc {
             Some(_) => Secret::new(mgmt::static_challenge_response(
@@ -1405,6 +1612,7 @@ mod tests {
             (FailureKind::CipherMismatch, "cipher_mismatch"),
             (FailureKind::Unreachable, "unreachable"),
             (FailureKind::Dropped, "dropped"),
+            (FailureKind::Timeout, "timeout"),
             (FailureKind::Failed, "failed"),
         ] {
             assert_eq!(kind.name(), name);

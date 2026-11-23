@@ -16,6 +16,10 @@
 //!   `data-ciphers ...:X` and `data-ciphers-fallback X` (see [`cipher_lines`]),
 //!   because OpenVPN 2.6 and newer ignore `cipher` when they agree a cipher
 //!   with the server;
+//! * `connect-timeout` from the settings is added, unless the profile or the
+//!   extra options set `connect-timeout` or `server-poll-timeout` themselves;
+//! * a `verb` in the extra options is taken out and given back as
+//!   [`PreparedProfile::verb`], because the level goes on the command line;
 //! * any `management...` lines are removed; this app sets its own (only
 //!   `management-log-cache` is added here, because the Windows interactive
 //!   service does not allow it on the command line).
@@ -34,11 +38,31 @@ pub struct PreparedProfile {
     pub static_challenge: bool,
     /// The servers OpenVPN will try, as `host:port`, in order.
     pub remotes: Vec<String>,
+    /// `tcp` or `udp` for each server in `remotes`.
+    pub protocols: Vec<String>,
+    /// The log level from a `verb` in the extra options, when there is one.
+    /// It wins over the `openvpn.verb` setting and is given to OpenVPN on the
+    /// command line, where it is the only `--verb`.
+    pub verb: Option<u8>,
     /// How many servers OpenVPN will try before it starts over: the `remote`
     /// lines in use plus any `<connection>` blocks. At least 1.
     pub remote_count: usize,
     /// What was changed for the user to know about, one sentence each.
     pub notes: Vec<String>,
+}
+
+impl PreparedProfile {
+    /// The servers with the protocol for each, such as `vpn.example.org:8443 (tcp)`.
+    pub fn server_labels(&self) -> Vec<String> {
+        self.remotes
+            .iter()
+            .enumerate()
+            .map(|(i, remote)| match self.protocols.get(i) {
+                Some(p) => format!("{remote} ({p})"),
+                None => remote.clone(),
+            })
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -107,6 +131,19 @@ struct Scan {
     public_remotes: usize,
     private_remotes: usize,
     connection_blocks: usize,
+    /// The `proto` line, for servers that do not name a protocol themselves.
+    proto: Option<String>,
+    /// The profile or the extra options say how long to wait for a server.
+    has_connect_timeout: bool,
+}
+
+/// `tcp` for `tcp`, `tcp-client`, `tcp4` and so on; `udp` for everything else,
+/// which is what OpenVPN uses when nothing is said.
+fn protocol_name(proto: Option<&str>) -> String {
+    match proto {
+        Some(p) if p.to_ascii_lowercase().starts_with("tcp") => "tcp".into(),
+        _ => "udp".into(),
+    }
 }
 
 fn scan(profile: &str, extra: &[String]) -> Scan {
@@ -133,6 +170,8 @@ fn scan(profile: &str, extra: &[String]) -> Scan {
             "cipher" => s.cipher = opt.args.first().map(|c| c.to_string()),
             "data-ciphers" | "ncp-ciphers" => s.has_data_ciphers = true,
             "data-ciphers-fallback" => s.has_fallback = true,
+            "proto" => s.proto = opt.args.first().map(|p| p.to_string()),
+            "connect-timeout" | "server-poll-timeout" => s.has_connect_timeout = true,
             "remote" => match opt.args.first() {
                 Some(host) if is_private_host(host) => s.private_remotes += 1,
                 Some(_) => s.public_remotes += 1,
@@ -298,8 +337,22 @@ fn remote_label(args: &[&str]) -> String {
     }
 }
 
+/// The level in a `verb N` line, if the line is one.
+fn verb_of(line: &str) -> Option<u8> {
+    let opt = option_line(line)?;
+    if opt.name != "verb" {
+        return None;
+    }
+    // OpenVPN itself reads a missing or odd level as an error; 11 is its highest.
+    Some(opt.args.first()?.parse::<u8>().ok()?.min(11))
+}
+
 pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, ProfileError> {
-    let extra = extra_option_lines(&settings.openvpn.extra_options)?;
+    let mut extra = extra_option_lines(&settings.openvpn.extra_options)?;
+    // The log level goes on the command line, once. Left in the config as
+    // well it would lose against that `--verb`.
+    let verb = extra.iter().filter_map(|l| verb_of(l)).next_back();
+    extra.retain(|l| verb_of(l).is_none());
     let remote_override = settings.profile.remote.trim();
     let found = scan(profile, &extra);
     let skip_private = remote_override.is_empty()
@@ -312,6 +365,7 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
     let mut has_auth = false;
     let mut static_challenge = false;
     let mut remotes = Vec::new();
+    let mut protocols = Vec::new();
     let mut skipped = Vec::new();
 
     for line in profile.lines() {
@@ -358,6 +412,9 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
                     out.push('\n');
                 } else {
                     remotes.push(remote_label(&opt.args));
+                    protocols.push(protocol_name(
+                        opt.args.get(2).copied().or(found.proto.as_deref()),
+                    ));
                     keep(&mut out);
                 }
             }
@@ -381,6 +438,7 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
             None => out.push_str(&format!("remote {host}\n")),
         }
         remotes.push(remote_override.to_string());
+        protocols.push(protocol_name(found.proto.as_deref()));
     }
     if !skipped.is_empty() {
         notes.push(format!(
@@ -401,6 +459,11 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
     }
     if ka.ping_restart > 0 {
         out.push_str(&format!("ping-restart {}\n", ka.ping_restart));
+    }
+    // So that OpenVPN gives up a server that does not answer after the same
+    // time this app allows a try without progress.
+    if settings.connect.timeout > 0 && !found.has_connect_timeout {
+        out.push_str(&format!("connect-timeout {}\n", settings.connect.timeout));
     }
     if let Some(cipher) = &found.cipher {
         let added = cipher_lines(cipher, found.has_data_ciphers, found.has_fallback);
@@ -427,6 +490,8 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
         text: out,
         static_challenge,
         remotes,
+        protocols,
+        verb,
         remote_count,
         notes,
     })
@@ -496,7 +561,10 @@ auth-user-pass
         assert!(p
             .text
             .contains("# removed by ovpn-otp: management 127.0.0.1 7505"));
-        assert!(p.text.contains("auth-nocache\nping 10\nping-restart 60\n"));
+        assert!(p
+            .text
+            .contains("auth-nocache\nping 10\nping-restart 60\nconnect-timeout 60\n"));
+        assert_eq!(p.server_labels(), vec!["203.0.113.10:8443 (tcp)"]);
         assert!(p.text.contains("remote inside-a-block-is-not-an-option"));
         assert_eq!(p.remotes, vec!["203.0.113.10:8443"]);
         assert_eq!(p.remote_count, 1);
@@ -533,9 +601,73 @@ auth-user-pass
     #[test]
     fn extra_options_are_appended() {
         let mut s = Settings::default();
-        s.openvpn.extra_options = vec!["verb 4".into(), " ".into()];
+        s.openvpn.extra_options = vec!["mute 10".into(), " ".into()];
         let p = prep("client\n", &s);
-        assert!(p.text.trim_end().ends_with("verb 4"));
+        assert!(p.text.trim_end().ends_with("mute 10"));
+        assert_eq!(p.verb, None);
+    }
+
+    /// A `verb` in the extra options used to lose against the `--verb 3` on
+    /// the command line. Now it is taken out of the config and handed back,
+    /// so that the one `--verb` on the command line carries it.
+    #[test]
+    fn verb_in_extra_options_is_handed_back_for_the_command_line() {
+        let mut s = Settings::default();
+        for items in [
+            strings(&["verb 5", "mute 10"]),
+            strings(&["--verb", "5", "--mute", "10"]),
+            strings(&["--verb 2", "--mute", "10", "--verb", "5"]),
+        ] {
+            s.openvpn.extra_options = items.clone();
+            let p = prep("client\nverb 1\n", &s);
+            assert_eq!(p.verb, Some(5), "{items:?}");
+            let added = p.text.split(MARK).nth(1).unwrap();
+            assert!(!added.contains("verb"), "{items:?}: {added}");
+            assert!(added.contains("mute 10\n"), "{items:?}: {added}");
+        }
+        s.openvpn.extra_options = strings(&["verb 99"]);
+        assert_eq!(prep("client\n", &s).verb, Some(11));
+    }
+
+    #[test]
+    fn says_which_protocol_each_server_uses() {
+        let p = prep(
+            "client\nremote a.example.org 1194\nremote b.example.org 443 tcp\n",
+            &Settings::default(),
+        );
+        assert_eq!(p.protocols, vec!["udp", "tcp"]);
+        assert_eq!(
+            p.server_labels(),
+            vec!["a.example.org:1194 (udp)", "b.example.org:443 (tcp)"]
+        );
+        // A `proto` line after the servers still counts for them.
+        let p = prep(
+            "client\nremote a.example.org 1194\nproto tcp-client\n",
+            &Settings::default(),
+        );
+        assert_eq!(p.server_labels(), vec!["a.example.org:1194 (tcp)"]);
+        let mut s = Settings::default();
+        s.profile.remote = "c.example.org:8443".into();
+        let p = prep("client\nproto tcp\nremote a.example.org 1194 udp\n", &s);
+        assert_eq!(p.server_labels(), vec!["c.example.org:8443 (tcp)"]);
+    }
+
+    #[test]
+    fn connect_timeout_follows_the_setting_unless_the_profile_has_its_own() {
+        let mut s = Settings::default();
+        s.connect.timeout = 25;
+        assert!(prep("client\n", &s).text.contains("\nconnect-timeout 25\n"));
+        for own in ["connect-timeout 10", "server-poll-timeout 10"] {
+            let p = prep(&format!("client\n{own}\n"), &s);
+            assert!(!p.text.contains("connect-timeout 25"), "{own}");
+        }
+        s.openvpn.extra_options = strings(&["connect-timeout 7"]);
+        let p = prep("client\n", &s);
+        assert!(!p.text.contains("connect-timeout 25"));
+        assert!(p.text.contains("connect-timeout 7\n"));
+        s.openvpn.extra_options.clear();
+        s.connect.timeout = 0;
+        assert!(!prep("client\n", &s).text.contains("connect-timeout"));
     }
 
     #[test]
@@ -694,6 +826,7 @@ auth-user-pass
             extra_option_lines(&strings(&["verb 4", "", "  mute 10 "])).unwrap(),
             vec!["verb 4", "mute 10"]
         );
+        // (`prepare` takes a `verb` out again; see the test for it above.)
         // Command-line tokens, as someone would type them after `openvpn`.
         assert_eq!(
             extra_option_lines(&strings(&[

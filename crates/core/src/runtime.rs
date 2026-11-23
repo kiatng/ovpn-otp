@@ -37,17 +37,56 @@ pub struct RuntimeDir {
     pub path: PathBuf,
 }
 
+/// What a session uses: which connection, profile, server and user name.
+///
+/// The window and `ovpn-otp status` always show this, so nobody has to guess
+/// what they are connecting to. Build it with [`crate::connect::describe`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Using {
+    /// The name of the connection in the settings file.
+    pub name: String,
+    /// The settings file.
+    pub settings: String,
+    /// The profile file, or a note that the profile is inside the settings file.
+    pub profile: String,
+    /// The servers OpenVPN tries, in order, such as `vpn.example.org:8443 (tcp)`.
+    pub servers: Vec<String>,
+    /// The user name of the login. Never the password.
+    pub username: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusFile {
     pub pid: u32,
     pub name: String,
     pub settings: String,
+    /// The profile file in use.
+    #[serde(default)]
+    pub profile: String,
+    /// The servers the profile points at, with the protocol.
+    #[serde(default)]
+    pub servers: Vec<String>,
+    /// The user name of the login.
+    #[serde(default)]
+    pub username: String,
     pub updated: DateTime<Local>,
     pub running: bool,
     pub snapshot: Snapshot,
 }
 
 impl StatusFile {
+    /// What the session uses.
+    pub fn using(&self) -> Using {
+        Using {
+            name: self.name.clone(),
+            settings: self.settings.clone(),
+            profile: self.profile.clone(),
+            servers: self.servers.clone(),
+            username: self.username.clone(),
+        }
+    }
+
     /// True when a session is still updating this file.
     pub fn is_live(&self) -> bool {
         self.running
@@ -164,8 +203,7 @@ impl RuntimeDir {
 /// Writes the runtime files for one session.
 pub struct Recorder {
     dir: RuntimeDir,
-    name: String,
-    settings: String,
+    using: Using,
     log: Option<File>,
     last_write: Option<Instant>,
     last_phase: Option<Phase>,
@@ -173,7 +211,7 @@ pub struct Recorder {
 
 impl Recorder {
     /// Start recording. Clears any old stop request or code and starts a fresh log.
-    pub fn new(dir: RuntimeDir, name: &str, settings_path: &Path) -> Recorder {
+    pub fn new(dir: RuntimeDir, using: Using) -> Recorder {
         let _ = std::fs::remove_file(dir.stop_path());
         let _ = std::fs::remove_file(dir.code_path());
         let log = OpenOptions::new()
@@ -184,8 +222,7 @@ impl Recorder {
             .ok();
         Recorder {
             dir,
-            name: name.to_string(),
-            settings: settings_path.display().to_string(),
+            using,
             log,
             last_write: None,
             last_phase: None,
@@ -220,8 +257,11 @@ impl Recorder {
         self.last_write = Some(Instant::now());
         let status = StatusFile {
             pid: std::process::id(),
-            name: self.name.clone(),
-            settings: self.settings.clone(),
+            name: self.using.name.clone(),
+            settings: self.using.settings.clone(),
+            profile: self.using.profile.clone(),
+            servers: self.using.servers.clone(),
+            username: self.using.username.clone(),
             updated: Local::now(),
             running,
             snapshot: snap.clone(),
@@ -379,17 +419,28 @@ pub fn log_record(ev: &Event) -> Option<LogRecord> {
 mod tests {
     use super::*;
 
+    fn using(name: &str) -> Using {
+        Using {
+            name: name.into(),
+            settings: "/s.toml".into(),
+            profile: "/vpn/work.ovpn".into(),
+            servers: vec!["vpn.example.org:8443 (tcp)".into()],
+            username: "alice".into(),
+        }
+    }
+
     #[test]
     fn status_round_trip_and_stop_request() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = RuntimeDir::at(tmp.path().join("run")).unwrap();
-        let mut rec = Recorder::new(dir.clone(), "work", Path::new("/s.toml"));
+        let mut rec = Recorder::new(dir.clone(), using("work"));
         let mut snap = Snapshot::default();
         snap.phase = Phase::Connected;
         snap.local_ip = "10.8.0.6".into();
         rec.write_status(&snap, true, true);
         let st = dir.read_status().unwrap();
         assert_eq!(st.name, "work");
+        assert_eq!(st.using(), using("work"));
         assert_eq!(st.snapshot.phase, Phase::Connected);
         assert!(st.is_live());
         // Our own process is not "another" session.
@@ -405,7 +456,7 @@ mod tests {
     fn log_file_gets_lines() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
-        let mut rec = Recorder::new(dir.clone(), "w", Path::new("s"));
+        let mut rec = Recorder::new(dir.clone(), using("w"));
         rec.record(&Event::Note {
             at: Local::now(),
             level: crate::mgmt::LogLevel::Info,
@@ -465,7 +516,7 @@ mod tests {
 
         // A code left over from an earlier session is not used by the next one.
         dir.submit_code("246802").unwrap();
-        let _rec = Recorder::new(dir.clone(), "w", Path::new("s"));
+        let _rec = Recorder::new(dir.clone(), using("w"));
         assert_eq!(dir.take_code(), None);
     }
 
@@ -473,7 +524,7 @@ mod tests {
     fn status_is_written_at_once_when_the_phase_changes() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
-        let mut rec = Recorder::new(dir.clone(), "w", Path::new("s"));
+        let mut rec = Recorder::new(dir.clone(), using("w"));
         let mut snap = Snapshot::default();
         snap.phase = Phase::NeedCode;
         rec.write_status(&snap, true, false);

@@ -221,8 +221,42 @@ fn other(kind: &str, body: &str) -> Notification {
     }
 }
 
+/// The state names OpenVPN reports (`man_state_name` in its `manage.c`).
+const STATE_NAMES: &[&str] = &[
+    "INITIAL",
+    "CONNECTING",
+    "RESOLVE",
+    "TCP_CONNECT",
+    "WAIT",
+    "AUTH",
+    "AUTH_PENDING",
+    "GET_CONFIG",
+    "ASSIGN_IP",
+    "ADD_ROUTES",
+    "CONNECTED",
+    "RECONNECTING",
+    "EXITING",
+];
+
+/// Whether `name` is the name of a connection state.
+///
+/// A log line has the same shape as a state line, `time,flags,message`, with
+/// one or more of the letters `I`, `W`, `N`, `F` and `D` where a state line
+/// has the name. So `1700000000,D,MANAGEMENT: CMD 'log on all'` must not be
+/// read as the state `D`. A name that OpenVPN may add later still counts
+/// when it is a word of capital letters that is not made of those letters.
+pub fn is_state_name(name: &str) -> bool {
+    if STATE_NAMES.contains(&name) {
+        return true;
+    }
+    name.len() >= 4
+        && name.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+        && !name.chars().all(|c| "IWNFD".contains(c))
+}
+
 /// Parse a state line: `time,STATE,detail,local_ip,remote_ip,remote_port,...`.
-/// Used for both `>STATE:` notifications and `state` history lines.
+/// Used for both `>STATE:` notifications and `state` history lines. A log
+/// line gives `None` (see [`is_state_name`]).
 pub fn parse_state(body: &str) -> Option<StateInfo> {
     let f: Vec<&str> = body.split(',').collect();
     if f.len() < 2 {
@@ -230,7 +264,7 @@ pub fn parse_state(body: &str) -> Option<StateInfo> {
     }
     let time = f[0].trim().parse().ok()?;
     let name = f[1].trim();
-    if name.is_empty() || !name.chars().all(|c| c.is_ascii_uppercase() || c == '_') {
+    if !is_state_name(name) {
         return None;
     }
     let get = |i: usize| f.get(i).map(|s| s.trim().to_string()).unwrap_or_default();
@@ -465,6 +499,40 @@ mod tests {
         assert_eq!(short.local_ip, "");
         assert!(parse_state("1700000001,0,I,hello").is_none());
         assert!(parse_state("garbage").is_none());
+    }
+
+    /// The lines of a captured log that were once shown as the states `D` and `I`.
+    #[test]
+    fn a_log_line_is_never_a_state() {
+        for line in [
+            "1795427689,D,MANAGEMENT: CMD 'log on all'",
+            "1795427689,D,MANAGEMENT: CMD 'hold release'",
+            "1795427689,I,OpenVPN 2.6.12 Windows [SSL (OpenSSL)] [LZO] [LZ4] [PKCS11] [AEAD] [DCO]",
+            "1795427689,I,library versions: OpenSSL 3.3.7 7 Apr 2026, LZO 2.10",
+            "1795427689,,MANAGEMENT: TCP Socket listening on [AF_INET]127.0.0.1:54589",
+            "1795427689,W,WARNING: something",
+            "1795427689,NW,two flags",
+            "1795427689,FD,two more",
+        ] {
+            assert_eq!(parse_state(line), None, "{line}");
+            assert_eq!(
+                parse_line(&format!(">STATE:{line}")),
+                Line::Notification(Notification::Other {
+                    kind: "STATE".into(),
+                    body: line.into()
+                })
+            );
+            // As a log line it reads fine.
+            assert!(parse_log(line).is_some(), "{line}");
+        }
+        for name in STATE_NAMES {
+            let s = parse_state(&format!("1700000001,{name},,,,")).expect(name);
+            assert_eq!(s.name, *name);
+        }
+        // A state OpenVPN may add one day.
+        assert!(is_state_name("NEW_STATE"));
+        assert!(!is_state_name("lower"));
+        assert!(!is_state_name("WIND"));
     }
 
     #[test]

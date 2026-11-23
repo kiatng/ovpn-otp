@@ -48,6 +48,7 @@ pub struct Settings {
     pub keepalive: KeepAlive,
     pub check: ReachCheck,
     pub code: CodeSettings,
+    pub connect: ConnectSettings,
     pub openvpn: OpenVpnSettings,
 }
 
@@ -59,6 +60,7 @@ impl Default for Settings {
             keepalive: KeepAlive::default(),
             check: ReachCheck::default(),
             code: CodeSettings::default(),
+            connect: ConnectSettings::default(),
             openvpn: OpenVpnSettings::default(),
         }
     }
@@ -142,6 +144,22 @@ impl Default for CodeSettings {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default, deny_unknown_fields)]
+pub struct ConnectSettings {
+    /// Seconds a try to connect may go without progress before it is ended
+    /// with a reason. OpenVPN gets the same number as its `connect-timeout`,
+    /// so a server that does not answer is given up after this long too.
+    /// 0 waits as long as OpenVPN does.
+    pub timeout: u32,
+}
+
+impl Default for ConnectSettings {
+    fn default() -> Self {
+        ConnectSettings { timeout: 60 }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct OpenVpnSettings {
@@ -150,10 +168,11 @@ pub struct OpenVpnSettings {
     /// Settings used on Linux.
     pub linux: OpenVpnPlatform,
     /// Extra OpenVPN options added after the profile. Write each option as one
-    /// item (`"verb 4"`), or as command-line tokens (`"--verb", "4"`); see
+    /// item (`"mute 10"`), or as command-line tokens (`"--mute", "10"`); see
     /// [`crate::profile::extra_option_lines`].
     pub extra_options: Vec<String>,
-    /// OpenVPN log detail, 1 (quiet) to 6 (very detailed). Default 3.
+    /// OpenVPN log detail, 0 (nothing) to 11. 3 when not set. A `verb` in
+    /// `extra_options` wins over this (see [`crate::profile::PreparedProfile::verb`]).
     pub verb: Option<u8>,
 }
 
@@ -322,6 +341,7 @@ mod tests {
         assert_eq!(s, Settings::default());
         assert_eq!(s.keepalive.ping, 10);
         assert_eq!(s.code.digits, 6);
+        assert_eq!(s.connect.timeout, 60);
     }
 
     #[test]

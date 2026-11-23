@@ -9,9 +9,9 @@
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
-use crate::runtime::StatusFile;
+use crate::runtime::{StatusFile, Using};
 use crate::session::{CodeReason, FailureKind};
-use crate::snapshot::Phase;
+use crate::snapshot::{Headline, Phase, Tone};
 
 /// The exit codes of the `ovpn-otp` command.
 pub mod exit_code {
@@ -29,7 +29,8 @@ pub mod exit_code {
     pub const UNREACHABLE: u8 = 5;
     /// The session is waiting for an authenticator code.
     pub const NEEDS_CODE: u8 = 6;
-    /// The time given with `--timeout` ran out.
+    /// A time limit ran out: the one given with `--timeout`, or a connect
+    /// made no progress for the `connect.timeout` in the settings.
     pub const TIMEOUT: u8 = 7;
     /// A working connection dropped and auto-reconnect is off.
     pub const DROPPED: u8 = 8;
@@ -42,6 +43,7 @@ pub fn failure_exit_code(kind: FailureKind) -> u8 {
         FailureKind::ServerReset | FailureKind::CipherMismatch => exit_code::SERVER_RESET,
         FailureKind::Unreachable => exit_code::UNREACHABLE,
         FailureKind::Dropped => exit_code::DROPPED,
+        FailureKind::Timeout => exit_code::TIMEOUT,
         FailureKind::Failed => exit_code::FAILED,
     }
 }
@@ -56,13 +58,22 @@ pub struct StatusReport {
     /// `idle`, `starting`, `connecting`, `need_code`, `connected`,
     /// `reconnecting`, `disconnecting`, `disconnected` or `failed`.
     pub phase: Phase,
+    /// The state in words, as the window shows it: `Connected`,
+    /// `Connecting…`, `Waiting for your code`, `Reconnecting…`,
+    /// `Disconnecting…`, `Disconnected` or `Failed`.
+    pub state: String,
+    /// What goes with `state`: the address and time when connected, the
+    /// step and time while connecting, the reason when failed.
+    pub state_detail: Option<String>,
+    /// What OpenVPN is doing right now, while connecting.
+    pub step: Option<String>,
     /// The session waits for a code; give it one with `ovpn-otp code`.
     pub needs_code: bool,
     /// Why a code is needed: `initial`, `reconnect`, `rejected`, `expired` or `retry`.
     pub code_reason: Option<CodeReason>,
     /// Why the last try failed: `auth_failed`, `server_reset`,
-    /// `cipher_mismatch`, `unreachable`, `dropped` or `failed`. `null` once
-    /// the session is connected.
+    /// `cipher_mismatch`, `unreachable`, `dropped`, `timeout` or `failed`.
+    /// `null` once the session is connected.
     pub failure_reason: Option<FailureKind>,
     /// The message that goes with `failure_reason`.
     pub last_error: Option<String>,
@@ -88,6 +99,13 @@ pub struct StatusReport {
     pub name: Option<String>,
     /// The settings file the session uses.
     pub settings: Option<String>,
+    /// The profile file in use.
+    pub profile: Option<String>,
+    /// The servers the profile points at, in the order OpenVPN tries them,
+    /// such as `vpn.example.org:8443 (tcp)`.
+    pub servers: Vec<String>,
+    /// The user name of the login. The password is never in a report.
+    pub username: Option<String>,
     /// The process that runs the session.
     pub pid: Option<u32>,
     /// When this status was written.
@@ -104,6 +122,9 @@ impl StatusReport {
         StatusReport {
             running: false,
             phase: Phase::Idle,
+            state: "Disconnected".into(),
+            state_detail: None,
+            step: None,
             needs_code: false,
             code_reason: None,
             failure_reason: None,
@@ -121,21 +142,49 @@ impl StatusReport {
             dns: Vec::new(),
             name: None,
             settings: None,
+            profile: None,
+            servers: Vec::new(),
+            username: None,
             pid: None,
             updated: None,
         }
     }
 
+    /// Say which connection, profile, servers and user name are in use.
+    fn set_using(&mut self, using: &Using) {
+        self.name = non_empty(&using.name);
+        self.settings = non_empty(&using.settings);
+        self.profile = non_empty(&using.profile);
+        self.servers = using.servers.clone();
+        self.username = non_empty(&using.username);
+    }
+
+    fn set_headline(&mut self, headline: Headline) {
+        self.state = headline.title;
+        self.state_detail = non_empty(&headline.detail);
+    }
+
     /// Build the report from the status file of a session, if there is one.
-    pub fn from_status(status: Option<&StatusFile>) -> StatusReport {
+    ///
+    /// `current` is what the settings say right now. A running session
+    /// reports what it uses itself; without one, the report says what the
+    /// next connect would use.
+    pub fn from_status(status: Option<&StatusFile>, current: Option<&Using>) -> StatusReport {
         let Some(st) = status else {
-            return StatusReport::idle();
+            let mut report = StatusReport::idle();
+            if let Some(using) = current {
+                report.set_using(using);
+            }
+            return report;
         };
         let s = &st.snapshot;
         let running = st.is_live();
         let mut report = StatusReport {
             running,
             phase: s.phase,
+            state: String::new(),
+            state_detail: None,
+            step: s.step().filter(|_| running).map(str::to_string),
             needs_code: running && s.phase == Phase::NeedCode,
             code_reason: s.code_reason.filter(|_| running),
             failure_reason: s.failure,
@@ -151,11 +200,19 @@ impl StatusReport {
             next_retry: s.next_retry.filter(|_| running),
             routes: s.routes.clone(),
             dns: s.dns.clone(),
-            name: Some(st.name.clone()),
-            settings: Some(st.settings.clone()),
+            name: None,
+            settings: None,
+            profile: None,
+            servers: Vec::new(),
+            username: None,
             pid: Some(st.pid),
             updated: Some(st.updated),
         };
+        match current.filter(|_| !running) {
+            Some(using) => report.set_using(using),
+            None => report.set_using(&st.using()),
+        }
+        report.set_headline(s.headline(Local::now()));
         if !running && s.phase.is_active() {
             // The program that ran the session is gone and never wrote how it ended.
             report.phase = Phase::Failed;
@@ -165,8 +222,26 @@ impl StatusReport {
                 st.pid
             ));
             report.since = Some(st.updated);
+            report.state = "Failed".into();
+            report.state_detail = report.last_error.clone();
         }
         report
+    }
+
+    /// The state as one line with its colour, for `ovpn-otp status`.
+    pub fn headline(&self) -> Headline {
+        let tone = match self.phase {
+            Phase::Connected => Tone::Good,
+            Phase::Failed => Tone::Bad,
+            Phase::NeedCode | Phase::Reconnecting => Tone::Attention,
+            Phase::Idle | Phase::Disconnected => Tone::Idle,
+            Phase::Starting | Phase::Connecting | Phase::Disconnecting => Tone::Busy,
+        };
+        Headline {
+            tone,
+            title: self.state.clone(),
+            detail: self.state_detail.clone().unwrap_or_default(),
+        }
     }
 
     pub fn to_json(&self) -> String {
@@ -241,6 +316,9 @@ mod tests {
             pid: std::process::id(),
             name: "work".into(),
             settings: "/x/settings.toml".into(),
+            profile: "/x/work.ovpn".into(),
+            servers: vec!["203.0.113.10:8443 (tcp)".into()],
+            username: "alice".into(),
             updated: Local::now(),
             running,
             snapshot,
@@ -248,7 +326,61 @@ mod tests {
     }
 
     fn report(running: bool, edit: impl FnOnce(&mut Snapshot)) -> StatusReport {
-        StatusReport::from_status(Some(&status(running, edit)))
+        StatusReport::from_status(Some(&status(running, edit)), None)
+    }
+
+    /// The window and `status` always say what is in use: the profile, the
+    /// server with its protocol, the connection and the user name.
+    #[test]
+    fn the_report_always_says_what_is_in_use() {
+        let now_set = Using {
+            name: "home".into(),
+            settings: "/y/settings.toml".into(),
+            profile: "/y/home.ovpn".into(),
+            servers: vec!["vpn.example.org:1194 (udp)".into()],
+            username: "bob".into(),
+        };
+        // Before any session: what the next connect would use.
+        let r = StatusReport::from_status(None, Some(&now_set));
+        assert_eq!(r.state, "Disconnected");
+        assert_eq!(r.profile.as_deref(), Some("/y/home.ovpn"));
+        assert_eq!(r.servers, vec!["vpn.example.org:1194 (udp)"]);
+        assert_eq!(r.name.as_deref(), Some("home"));
+        assert_eq!(r.username.as_deref(), Some("bob"));
+
+        // A running session: what it uses, even when the settings changed since.
+        let st = status(true, |s| {
+            s.phase = Phase::Connecting;
+            s.state = "AUTH".into();
+            s.connecting_since = Some(Local::now() - chrono::Duration::seconds(12));
+        });
+        let r = StatusReport::from_status(Some(&st), Some(&now_set));
+        assert_eq!(r.profile.as_deref(), Some("/x/work.ovpn"));
+        assert_eq!(r.servers, vec!["203.0.113.10:8443 (tcp)"]);
+        assert_eq!(r.name.as_deref(), Some("work"));
+        assert_eq!(r.username.as_deref(), Some("alice"));
+        assert_eq!(r.state, "Connecting…");
+        assert_eq!(r.step.as_deref(), Some("logging in"));
+        assert_eq!(r.state_detail.as_deref(), Some("logging in (12s)"));
+        assert_eq!(r.headline().tone, Tone::Busy);
+
+        // After it ended: the settings as they are now.
+        let st = status(false, |s| {
+            s.phase = Phase::Failed;
+            s.failure = Some(FailureKind::Timeout);
+            s.last_error = Some("gave up".into());
+        });
+        let r = StatusReport::from_status(Some(&st), Some(&now_set));
+        assert_eq!(r.profile.as_deref(), Some("/y/home.ovpn"));
+        assert_eq!(r.state, "Failed");
+        assert_eq!(r.state_detail.as_deref(), Some("gave up"));
+        assert_eq!(r.step, None);
+        assert_eq!(r.headline().line(), "Failed: gave up");
+        // Without the settings at hand, the last session still says what it used.
+        let r = StatusReport::from_status(Some(&st), None);
+        assert_eq!(r.profile.as_deref(), Some("/x/work.ovpn"));
+        // The password has no place in a report.
+        assert!(!r.to_json().to_lowercase().contains("password"));
     }
 
     #[test]
@@ -257,6 +389,12 @@ mod tests {
         for field in [
             "running",
             "phase",
+            "state",
+            "state_detail",
+            "step",
+            "profile",
+            "servers",
+            "username",
             "needs_code",
             "code_reason",
             "failure_reason",
@@ -336,6 +474,7 @@ mod tests {
             (FailureKind::CipherMismatch, "cipher_mismatch", 4),
             (FailureKind::Unreachable, "unreachable", 5),
             (FailureKind::Dropped, "dropped", 8),
+            (FailureKind::Timeout, "timeout", 7),
             (FailureKind::Failed, "failed", 1),
         ] {
             let r = report(false, |s| {
@@ -412,9 +551,10 @@ mod tests {
         });
         // Long past the time a live session would have rewritten the file.
         st.updated = Local::now() - chrono::Duration::seconds(120);
-        let r = StatusReport::from_status(Some(&st));
+        let r = StatusReport::from_status(Some(&st), None);
         assert!(!r.running);
         assert_eq!(r.phase, Phase::Failed);
+        assert_eq!(r.state, "Failed");
         assert_eq!(r.failure_reason, Some(FailureKind::Failed));
         assert!(r.last_error.unwrap().contains("without cleaning up"));
         assert_eq!(r.connected_since, None);

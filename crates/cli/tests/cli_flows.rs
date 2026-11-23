@@ -661,3 +661,686 @@ extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-GCM:AES-128-CBC", "--dat
         assert!(ran.stderr.contains(message), "{}", ran.stderr);
     }
 }
+
+/// The stall first seen on Windows, through the real command: the stand-in
+/// OpenVPN reads its management socket the way OpenVPN does on Windows, and
+/// the connect still comes up.
+#[test]
+fn connects_to_an_openvpn_that_reads_while_it_answers() {
+    let mut sandbox = Sandbox::new("login");
+    sandbox.fake.push_str(";windows-reentry=1");
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    let report = ran.json();
+    assert_eq!(report["phase"], "connected");
+    assert_eq!(report["openvpn_state"], "CONNECTED");
+    // No log line was taken for a state.
+    for record in sandbox.logs(&[]) {
+        if record["source"] == "state" {
+            let message = record["message"].as_str().unwrap();
+            let name = message.split(' ').next().unwrap();
+            assert!(name.len() >= 4, "a log line as a state: {message}");
+        }
+    }
+    assert_no_secrets(&sandbox, &[&ran]);
+}
+
+/// `status` says which profile, server, connection and user name are in
+/// use, and the state in words: before a session, while one connects, when
+/// it is up, and after it failed.
+#[test]
+fn status_shows_what_is_in_use_and_the_state_in_words() {
+    // Before any session: what the next connect would use.
+    let sandbox = Sandbox::new("login");
+    let idle = sandbox.status();
+    assert_eq!(idle["state"], "Disconnected");
+    assert_eq!(idle["name"], "cli-test");
+    assert_eq!(idle["profile"], "inside the settings file");
+    assert_eq!(idle["servers"][0], "198.51.100.7:8443 (tcp)");
+    assert_eq!(idle["servers"].as_array().unwrap().len(), 1);
+    assert!(idle["username"].is_null(), "no login is saved in the tests");
+    let text = sandbox.run(&["status"], "");
+    assert_eq!(text.code, 0, "{}", text.stderr);
+    for line in [
+        "State:      Disconnected",
+        "Connection: cli-test",
+        "Profile:    inside the settings file",
+        "Server:     198.51.100.7:8443 (tcp)",
+        "User:       no saved login",
+    ] {
+        assert!(
+            text.stdout.contains(line),
+            "`{line}` not in:\n{}",
+            text.stdout
+        );
+    }
+
+    // Connected.
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    let up = sandbox.status();
+    assert_eq!(up["state"], "Connected");
+    assert!(
+        up["state_detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("address 10.8.0.6, since "),
+        "{up}"
+    );
+    assert_eq!(up["username"], USER);
+    assert_eq!(up["profile"], "inside the settings file");
+    assert_eq!(up["servers"][0], "198.51.100.7:8443 (tcp)");
+    assert!(up["step"].is_null());
+    let text = sandbox.run(&["status"], "");
+    for line in [
+        "State:      Connected: address 10.8.0.6, since ",
+        "Connection: cli-test",
+        "Server:     198.51.100.7:8443 (tcp)\n",
+        &format!("User:       {USER}"),
+    ] {
+        assert!(
+            text.stdout.contains(line),
+            "`{line}` not in:\n{}",
+            text.stdout
+        );
+    }
+    // No colour codes when the output is not a terminal.
+    assert!(!text.stdout.contains('\x1b'));
+    let ended = sandbox.run(&["disconnect", "--json"], "");
+    assert_eq!(ended.code, 0, "{}", ended.stderr);
+    let after = ended.json();
+    assert_eq!(after["running"], false);
+    assert_eq!(after["state"], "Disconnected");
+    drop(sandbox);
+
+    // Connecting, with the step and how long it has been.
+    let sandbox = Sandbox::new("hang");
+    let ran = sandbox.run(
+        &[
+            "connect",
+            "--username",
+            USER,
+            "--password-stdin",
+            "--code-stdin",
+            "--background",
+            "--timeout",
+            "1",
+        ],
+        &format!("{PASSWORD}\n{CODE}\n"),
+    );
+    assert_eq!(ran.code, 7, "stderr: {}", ran.stderr);
+    drop(sandbox);
+    let sandbox = Sandbox::new("hang");
+    let mut child = sandbox
+        .command(&[
+            "connect",
+            "--username",
+            USER,
+            "--password-stdin",
+            "--code",
+            CODE,
+        ])
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(format!("{PASSWORD}\n").as_bytes()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let busy = loop {
+        let now = sandbox.status();
+        if now["openvpn_state"] == "TCP_CONNECT" {
+            break now;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "never connecting: {now}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    assert_eq!(busy["state"], "Connecting…");
+    assert_eq!(busy["step"], "opening a connection to the server");
+    assert!(
+        busy["state_detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("opening a connection to the server ("),
+        "{busy}"
+    );
+    assert_eq!(busy["username"], USER);
+    let text = sandbox.run(&["status"], "");
+    assert!(
+        text.stdout
+            .contains("State:      Connecting…: opening a connection to the server ("),
+        "{}",
+        text.stdout
+    );
+    let ended = sandbox.run(&["disconnect"], "");
+    assert_eq!(ended.code, 0, "{}", ended.stderr);
+    drop(stdin);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    // The foreground connect said what it uses before it tried.
+    let said = String::from_utf8_lossy(&out.stderr);
+    for line in [
+        "Connection: cli-test",
+        "Server:     198.51.100.7:8443 (tcp)",
+    ] {
+        assert!(said.contains(line), "`{line}` not in:\n{said}");
+    }
+    assert!(said.contains(&format!("User:       {USER}")), "{said}");
+    drop(sandbox);
+
+    // Failed, with the reason.
+    let sandbox = Sandbox::new("unreachable");
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 5);
+    let failed = sandbox.status();
+    assert_eq!(failed["state"], "Failed");
+    assert!(
+        failed["state_detail"]
+            .as_str()
+            .unwrap()
+            .contains("Could not reach the VPN server"),
+        "{failed}"
+    );
+    let text = sandbox.run(&["status"], "");
+    assert!(
+        text.stdout
+            .contains("State:      Failed: Could not reach the VPN server"),
+        "{}",
+        text.stdout
+    );
+    assert!(
+        text.stdout.contains("Reason:     unreachable"),
+        "{}",
+        text.stdout
+    );
+    assert!(text.stdout.contains("Profile:    inside the settings file"));
+}
+
+/// A connect that makes no progress ends by itself after `connect.timeout`,
+/// with exit code 7 and the step it was stuck in, instead of staying on
+/// "Connecting" until someone gives up.
+#[test]
+fn a_connect_without_progress_ends_with_7_and_says_where_it_stuck() {
+    let sandbox = Sandbox::with_settings("hang", "[connect]\ntimeout = 1\n");
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 7, "stderr: {}", ran.stderr);
+    assert!(
+        ran.stderr.contains("after 1 seconds without progress")
+            && ran.stderr.contains("the server did not answer"),
+        "{}",
+        ran.stderr
+    );
+    let report = ran.json();
+    assert_eq!(report["failure_reason"], "timeout");
+    assert_eq!(report["phase"], "failed");
+    assert_eq!(report["state"], "Failed");
+    assert_eq!(report["running"], false);
+    assert_eq!(report["needs_code"], false);
+    // OpenVPN got the same limit for a server that does not answer.
+    assert!(sandbox
+        .logs(&[])
+        .iter()
+        .any(|r| r["message"].as_str().unwrap().starts_with("timeout:")));
+    let waited = sandbox.run(&["wait", "--until", "connected", "--timeout", "5"], "");
+    assert_eq!(waited.code, 7);
+    assert_no_secrets(&sandbox, &[&ran]);
+
+    let sandbox = Sandbox::with_settings("login", "[connect]\ntimeout = 25\n");
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    let prepared = std::fs::read_to_string(sandbox.runtime_dir().join("cli-test.ovpn")).unwrap();
+    assert!(prepared.contains("\nconnect-timeout 25\n"), "{prepared}");
+}
+
+/// A `verb` in the extra options used to lose against the `--verb 3` that
+/// ovpn-otp put on the command line. Now OpenVPN gets one `--verb`, with
+/// the level from the extra options, or else from `openvpn.verb`.
+#[test]
+fn the_log_level_from_the_settings_reaches_openvpn_once() {
+    for (extra, verb) in [
+        (
+            "[openvpn]\nextra_options = [\"verb 5\", \"mute 10\"]\n",
+            "5",
+        ),
+        (
+            "[openvpn]\nextra_options = [\"--verb\", \"6\"]\nverb = 4\n",
+            "6",
+        ),
+        ("[openvpn]\nverb = 4\n", "4"),
+        ("", "3"),
+    ] {
+        let sandbox = Sandbox::with_settings("login", extra);
+        let ran = sandbox.connect_background();
+        assert_eq!(ran.code, 0, "{extra}: {}", ran.stderr);
+        let logs = sandbox.logs(&[]);
+        let started = logs
+            .iter()
+            .filter_map(|r| r["message"].as_str())
+            .find(|m| m.starts_with("Started: "))
+            .unwrap_or_else(|| panic!("{extra}: no start line"));
+        assert!(
+            started.ends_with(&format!("--verb {verb}")),
+            "{extra}: {started}"
+        );
+        assert_eq!(started.matches("--verb").count(), 1, "{extra}: {started}");
+        let prepared =
+            std::fs::read_to_string(sandbox.runtime_dir().join("cli-test.ovpn")).unwrap();
+        let added = prepared.split("added by ovpn-otp").nth(1).unwrap();
+        assert!(!added.contains("verb"), "{extra}: {added}");
+        if extra.contains("mute") {
+            assert!(added.contains("mute 10\n"), "{added}");
+        }
+        let doctor = sandbox.run(&["doctor"], "");
+        assert_eq!(
+            doctor.stdout.contains(&format!("--verb {verb}")),
+            verb != "3",
+            "{extra}: {}",
+            doctor.stdout
+        );
+    }
+}
+
+/// Every setting can be read and changed by name, the way the window lets
+/// you change it.
+#[test]
+fn config_reads_and_changes_each_setting_by_name() {
+    let sandbox = Sandbox::new("login");
+    let get = |key: &str| sandbox.run(&["config", "get", key], "");
+    assert_eq!(get("name").stdout, "cli-test\n");
+    assert_eq!(get("keepalive.ping").stdout, "10\n");
+    assert_eq!(get("keepalive.auto_reconnect").stdout, "true\n");
+    assert_eq!(get("connect.timeout").stdout, "60\n");
+    let unset = get("openvpn.verb");
+    assert_eq!((unset.code, unset.stdout.as_str()), (0, ""));
+    assert!(unset.stderr.contains("not set"), "{}", unset.stderr);
+    assert!(sandbox
+        .run(&["config", "get", "openvpn.verb", "--json"], "")
+        .json()
+        .is_null());
+
+    for (key, values, expect) in [
+        ("keepalive.ping", vec!["25"], "25\n"),
+        ("keepalive.auto_reconnect", vec!["off"], "false\n"),
+        ("check.host", vec!["10.0.0.1:443"], "10.0.0.1:443\n"),
+        ("code.digits", vec!["8"], "8\n"),
+        ("connect.timeout", vec!["30"], "30\n"),
+        ("openvpn.verb", vec!["5"], "5\n"),
+        (
+            "profile.remote",
+            vec!["vpn.example.org:1194"],
+            "vpn.example.org:1194\n",
+        ),
+        (
+            "openvpn.extra_options",
+            vec!["--mute", "10", "--disable-dco"],
+            "--mute\n10\n--disable-dco\n",
+        ),
+        (
+            "openvpn.linux.command_prefix",
+            vec!["sudo", "-n"],
+            "sudo\n-n\n",
+        ),
+        ("name", vec!["renamed"], "renamed\n"),
+    ] {
+        let mut args = vec!["config", "set", key];
+        args.extend(values);
+        let ran = sandbox.run(&args, "");
+        assert_eq!(ran.code, 0, "{args:?}: {}", ran.stderr);
+        assert_eq!(get(key).stdout, expect, "{key}");
+    }
+    // The file on disk is what changed, and nothing else moved.
+    let shown = sandbox.run(&["config", "show", "--json"], "").json();
+    assert_eq!(shown["name"], "renamed");
+    assert_eq!(shown["keepalive"]["ping"], 25);
+    assert_eq!(shown["keepalive"]["ping_restart"], 60);
+    assert_eq!(shown["keepalive"]["backoff_initial"], 1);
+    assert_eq!(shown["connect"]["timeout"], 30);
+    assert_eq!(shown["openvpn"]["verb"], 5);
+    assert_eq!(shown["openvpn"]["extra_options"][2], "--disable-dco");
+    assert_eq!(
+        sandbox
+            .run(&["config", "get", "openvpn.extra_options", "--json"], "")
+            .json(),
+        serde_json::json!(["--mute", "10", "--disable-dco"])
+    );
+    let text = sandbox.run(&["config", "show"], "");
+    assert!(text.stdout.contains("ping = 25"), "{}", text.stdout);
+    // The profile and the server follow the changed settings at once.
+    let status = sandbox.status();
+    assert_eq!(status["name"], "renamed");
+    assert_eq!(status["servers"][0], "vpn.example.org:1194 (tcp)");
+
+    for key in [
+        "keepalive.ping",
+        "openvpn.verb",
+        "openvpn.linux.command_prefix",
+    ] {
+        let ran = sandbox.run(&["config", "unset", key], "");
+        assert_eq!(ran.code, 0, "{}", ran.stderr);
+    }
+    assert_eq!(get("keepalive.ping").stdout, "10\n");
+    assert_eq!(get("openvpn.verb").stdout, "");
+    assert_eq!(get("openvpn.linux.command_prefix").stdout, "");
+
+    // Mistakes end with exit code 2 and change nothing.
+    for (args, said) in [
+        (
+            vec!["config", "get", "ping"],
+            "Did you mean keepalive.ping?",
+        ),
+        (
+            vec!["config", "set", "keepalive.ping", "soon"],
+            "not a whole number",
+        ),
+        (
+            vec!["config", "set", "openvpn.verb", "99"],
+            "highest value is 11",
+        ),
+        (
+            vec!["config", "set", "no.such.key", "1"],
+            "there is no setting",
+        ),
+        (
+            vec!["config", "set", "openvpn.extra_options", "-v"],
+            "option name",
+        ),
+        (vec!["config", "unset", "nope"], "there is no setting"),
+    ] {
+        let ran = sandbox.run(&args, "");
+        assert_eq!(ran.code, 2, "{args:?}: {}", ran.stderr);
+        assert!(ran.stderr.contains(said), "{args:?}: {}", ran.stderr);
+    }
+    assert_eq!(get("keepalive.ping").stdout, "10\n");
+
+    // The list of every setting, for people and for scripts.
+    let keys = sandbox.run(&["config", "keys"], "");
+    for line in [
+        "keepalive.ping = 10",
+        "connect.timeout = 30",
+        "openvpn.verb = (not set)",
+    ] {
+        assert!(
+            keys.stdout.contains(line),
+            "`{line}` not in:\n{}",
+            keys.stdout
+        );
+    }
+    let keys = sandbox.run(&["config", "keys", "--json"], "").json();
+    let names: Vec<&str> = keys
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| k["key"].as_str().unwrap())
+        .collect();
+    for name in [
+        "name",
+        "profile.path",
+        "check.host",
+        "connect.timeout",
+        "openvpn.windows.launch",
+    ] {
+        assert!(names.contains(&name), "{name} not in {names:?}");
+    }
+    assert!(keys[0]["help"].is_string() && keys[0]["kind"].is_string());
+}
+
+#[test]
+fn config_edit_opens_the_editor_and_checks_the_file_afterwards() {
+    let sandbox = Sandbox::new("login");
+    let ran = sandbox
+        .command(&["config", "edit"])
+        .env("VISUAL", "")
+        .env("EDITOR", "true")
+        .output()
+        .unwrap();
+    assert_eq!(
+        ran.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+    assert!(String::from_utf8_lossy(&ran.stderr).contains("is fine"));
+
+    // An editor that leaves a mistake behind: it is said now, not at connect.
+    let script = sandbox.dir.path().join("break.sh");
+    std::fs::write(&script, "#!/bin/sh\necho 'pasword = \"x\"' >> \"$1\"\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let ran = sandbox
+        .command(&["config", "edit"])
+        .env("VISUAL", &script)
+        .output()
+        .unwrap();
+    assert_eq!(ran.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&ran.stderr).contains("is not valid"),
+        "{}",
+        String::from_utf8_lossy(&ran.stderr)
+    );
+}
+
+#[test]
+fn profile_shows_sets_and_lists_the_profile_in_use() {
+    let sandbox = Sandbox::new("login");
+    let dir = sandbox.dir.path();
+    let shown = sandbox.run(&["profile", "show", "--json"], "").json();
+    assert_eq!(shown["inline"], true);
+    assert!(shown["path"].is_null());
+    assert_eq!(shown["servers"][0], "198.51.100.7:8443 (tcp)");
+    assert_eq!(shown["static_challenge"], false);
+    assert_eq!(shown["notes"].as_array().unwrap().len(), 2);
+    let text = sandbox.run(&["profile", "show"], "");
+    assert!(
+        text.stdout.contains("Profile:    inside the settings file"),
+        "{}",
+        text.stdout
+    );
+    assert!(
+        text.stdout.contains("Server:     198.51.100.7:8443 (tcp)"),
+        "{}",
+        text.stdout
+    );
+
+    std::fs::create_dir_all(dir.join("vpn")).unwrap();
+    std::fs::write(
+        dir.join("vpn/home.ovpn"),
+        "client\nremote home.example.org 1194\nremote backup.example.org 443 tcp\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("office.ovpn"),
+        "client\nproto tcp\nremote office.example.org 8443\n",
+    )
+    .unwrap();
+
+    let list = sandbox.run(&["profile", "list", "--json"], "").json();
+    let list = list.as_array().unwrap();
+    assert_eq!(list.len(), 2, "{list:?}");
+    assert!(list.iter().all(|p| p["in_use"] == false));
+    assert_eq!(list[0]["servers"][0], "office.example.org:8443 (tcp)");
+
+    let set = sandbox.run(
+        &[
+            "profile",
+            "set",
+            dir.join("vpn/home.ovpn").to_str().unwrap(),
+        ],
+        "",
+    );
+    assert_eq!(set.code, 0, "{}", set.stderr);
+    assert!(
+        set.stderr.contains("home.example.org:1194 (udp)"),
+        "{}",
+        set.stderr
+    );
+    // Next to the settings file, so the path is kept relative to it.
+    assert_eq!(
+        sandbox.run(&["config", "get", "profile.path"], "").stdout,
+        "vpn/home.ovpn\n"
+    );
+    let shown = sandbox.run(&["profile", "show", "--json"], "").json();
+    assert!(
+        shown["path"].as_str().unwrap().ends_with("vpn/home.ovpn"),
+        "{shown}"
+    );
+    assert_eq!(shown["inline"], false);
+    assert_eq!(
+        shown["servers"],
+        serde_json::json!([
+            "home.example.org:1194 (udp)",
+            "backup.example.org:443 (tcp)"
+        ])
+    );
+    let status = sandbox.status();
+    assert!(status["profile"]
+        .as_str()
+        .unwrap()
+        .ends_with("vpn/home.ovpn"));
+    assert_eq!(status["servers"][0], "home.example.org:1194 (udp)");
+
+    let list = sandbox.run(&["profile", "list"], "");
+    assert_eq!(list.code, 0);
+    let lines: Vec<&str> = list.stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "{}", list.stdout);
+    assert!(
+        lines[0].starts_with("  ") && lines[0].contains("office.ovpn"),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[1].starts_with("* ")
+            && lines[1].ends_with("home.example.org:1194 (udp), backup.example.org:443 (tcp)"),
+        "{}",
+        lines[1]
+    );
+    // A folder named on the command line is the only one searched.
+    let only = sandbox.run(
+        &[
+            "profile",
+            "list",
+            dir.join("vpn").to_str().unwrap(),
+            "--json",
+        ],
+        "",
+    );
+    assert_eq!(only.json().as_array().unwrap().len(), 1);
+    assert_eq!(only.json()[0]["in_use"], true);
+
+    let missing = sandbox.run(&["profile", "set", "/nowhere/x.ovpn"], "");
+    assert_eq!(missing.code, 1);
+    assert!(
+        missing.stderr.contains("cannot find the profile"),
+        "{}",
+        missing.stderr
+    );
+    // A profile that went missing: `show` says so and ends with 1.
+    std::fs::remove_file(dir.join("vpn/home.ovpn")).unwrap();
+    let gone = sandbox.run(&["profile", "show"], "");
+    assert_eq!(gone.code, 1);
+    assert!(gone.stdout.contains("Problem:"), "{}", gone.stdout);
+}
+
+/// `reconnect` stops the running session and starts a new one.
+#[test]
+fn reconnect_replaces_the_running_session() {
+    let sandbox = Sandbox::new("login");
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    let first = sandbox.status()["pid"].as_u64().unwrap();
+    let again = sandbox.run(
+        &[
+            "reconnect",
+            "--username",
+            USER,
+            "--password-stdin",
+            "--code-stdin",
+            "--background",
+            "--json",
+        ],
+        &format!("{PASSWORD}\n{CODE}\n"),
+    );
+    assert_eq!(again.code, 0, "stderr: {}", again.stderr);
+    assert!(
+        again.stderr.contains("Connecting again"),
+        "{}",
+        again.stderr
+    );
+    let report = again.json();
+    assert_eq!(report["phase"], "connected");
+    assert_ne!(report["pid"].as_u64().unwrap(), first, "the same session");
+    assert!(!std::path::Path::new(&format!("/proc/{first}")).exists());
+    assert_no_secrets(&sandbox, &[&ran, &again]);
+    drop(sandbox);
+
+    // With nothing running it is a plain connect.
+    let sandbox = Sandbox::new("login");
+    let ran = sandbox.run(
+        &[
+            "reconnect",
+            "--username",
+            USER,
+            "--password-stdin",
+            "--code-stdin",
+            "--background",
+        ],
+        &format!("{PASSWORD}\n{CODE}\n"),
+    );
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    assert!(!ran.stderr.contains("Connecting again"));
+}
+
+#[test]
+fn doctor_and_logs_have_json_and_a_level_filter() {
+    let sandbox = Sandbox::new("unreachable");
+    let doctor = sandbox.run(&["doctor", "--json"], "");
+    // No login is saved in the tests, so one check fails.
+    assert_eq!(doctor.code, 1);
+    let report = doctor.json();
+    assert_eq!(report["ok"], false);
+    let checks = report["checks"].as_array().unwrap();
+    let check = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap_or_else(|| panic!("no check `{name}` in {checks:?}"))
+    };
+    assert_eq!(check("settings")["ok"], true);
+    assert_eq!(check("profile")["ok"], true);
+    assert!(check("profile")["detail"]
+        .as_str()
+        .unwrap()
+        .contains("198.51.100.7:8443 (tcp)"));
+    assert_eq!(check("openvpn")["ok"], true);
+    assert_eq!(check("saved login")["ok"], false);
+    assert_eq!(report["notes"].as_array().unwrap().len(), 2);
+
+    let ran = sandbox.connect_background();
+    assert_eq!(ran.code, 5);
+    let all = sandbox.logs(&[]);
+    let errors = sandbox.logs(&["--level", "error"]);
+    assert!(!errors.is_empty() && errors.len() < all.len());
+    assert!(errors
+        .iter()
+        .all(|r| r["level"] == "error" || r["level"] == "fatal"));
+    let warnings = sandbox.logs(&["--level", "warning"]);
+    assert!(warnings.len() >= errors.len());
+}
+
+/// The saved login is managed without a window too. The tests have no
+/// credential store, so only what does not need one is checked here; the
+/// rest is tested inside the program with a store in memory.
+#[test]
+fn login_commands_never_take_the_password_as_an_option() {
+    let sandbox = Sandbox::new("login");
+    let ran = sandbox.run(&["login", "set", "--password", PASSWORD], "");
+    assert_eq!(ran.code, 2, "{}", ran.stderr);
+    let ran = sandbox.run(
+        &["login", "set", "--password-stdin"],
+        &format!("{PASSWORD}\n"),
+    );
+    assert_ne!(ran.code, 0);
+    assert!(!ran.stderr.contains(PASSWORD) && !ran.stdout.contains(PASSWORD));
+    let shown = sandbox.run(&["login", "show"], "");
+    assert!(!shown.stdout.contains(PASSWORD) && !shown.stderr.contains(PASSWORD));
+}

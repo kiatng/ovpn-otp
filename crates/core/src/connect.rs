@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use crate::credentials::Login;
 use crate::launch::{LaunchError, LaunchRequest, Launcher, OpenVpnLauncher};
 use crate::profile::{self, PreparedProfile, ProfileError};
-use crate::runtime::RuntimeDir;
+use crate::runtime::{RuntimeDir, Using};
 use crate::session::{self, SessionHandle, SessionOptions};
-use crate::settings::{LoadedSettings, SettingsError};
+use crate::settings::{LoadedSettings, Settings, SettingsError};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectError {
@@ -35,6 +35,39 @@ pub struct Prepared {
     /// The `remote` the profile points at, for display.
     pub remotes: Vec<String>,
     pub static_challenge: bool,
+    /// What the session uses, for the status.
+    pub using: Using,
+}
+
+/// The log level OpenVPN gets as its one `--verb`: a `verb` in the extra
+/// options wins, then the `openvpn.verb` setting, then 3.
+pub fn effective_verb(settings: &Settings, prepared: &PreparedProfile) -> u8 {
+    prepared.verb.or(settings.openvpn.verb).unwrap_or(3).min(11)
+}
+
+/// What a session with these settings uses: connection name, settings file,
+/// profile, servers and user name. Works without a readable profile too; the
+/// servers are then left empty.
+pub fn describe(loaded: &LoadedSettings, username: &str) -> Using {
+    let settings = &loaded.settings;
+    let profile = match loaded.profile_path() {
+        Some(p) => p.display().to_string(),
+        None if settings.profile.inline.trim().is_empty() => String::new(),
+        None => "inside the settings file".to_string(),
+    };
+    let servers = loaded
+        .profile_text()
+        .ok()
+        .and_then(|(text, _)| profile::prepare(&text, settings).ok())
+        .map(|p| p.server_labels())
+        .unwrap_or_default();
+    Using {
+        name: settings.name.clone(),
+        settings: loaded.path.display().to_string(),
+        profile,
+        servers,
+        username: username.trim().to_string(),
+    }
 }
 
 /// Check that a session could be prepared, without writing anything: the
@@ -65,6 +98,11 @@ pub fn prepare(
     let launcher = OpenVpnLauncher::from_settings(settings)?;
     let (text, work_dir) = loaded.profile_text()?;
     let prepared = profile::prepare(&text, settings)?;
+    let using = Using {
+        servers: prepared.server_labels(),
+        ..describe(loaded, &login.username)
+    };
+    let verb = effective_verb(settings, &prepared);
     let config_path = session::prepared_config_path(&runtime.path, &settings.name);
     crate::launch::write_private(&config_path, prepared.text.as_bytes()).map_err(|e| {
         ConnectError::Prepare {
@@ -82,12 +120,13 @@ pub fn prepare(
             config: config_path.clone(),
             work_dir,
             private_dir: runtime.path.clone(),
-            verb: settings.openvpn.verb.unwrap_or(3).clamp(1, 11),
+            verb,
         },
         retry_login: true,
         remotes: prepared.remotes.clone(),
         remote_count: prepared.remote_count,
         notes: prepared.notes,
+        connect_timeout: std::time::Duration::from_secs(settings.connect.timeout.into()),
     };
     Ok(Prepared {
         options,
@@ -95,6 +134,7 @@ pub fn prepare(
         config_path,
         remotes: prepared.remotes,
         static_challenge: prepared.static_challenge,
+        using,
     })
 }
 
@@ -133,6 +173,106 @@ mod tests {
         }
         // Nothing was written for OpenVPN either.
         assert_eq!(std::fs::read_dir(&runtime.path).unwrap().count(), 0);
+    }
+
+    fn loaded_with(dir: &std::path::Path, edit: impl FnOnce(&mut Settings)) -> LoadedSettings {
+        let mut settings = Settings {
+            name: "work".into(),
+            ..Settings::default()
+        };
+        settings.openvpn.linux.path = "/bin/sh".into();
+        settings.openvpn.windows.path = "C:\\Windows\\System32\\cmd.exe".into();
+        settings.openvpn.windows.launch = "direct".into();
+        settings.openvpn.linux.command_prefix = Some(Vec::new());
+        edit(&mut settings);
+        LoadedSettings {
+            path: dir.join("settings.toml"),
+            settings,
+        }
+    }
+
+    /// The fix for a `verb` in the extra options that lost against the
+    /// `--verb 3` on the command line: OpenVPN gets one `--verb`, and the
+    /// extra options win over the setting, which wins over 3.
+    #[test]
+    fn the_log_level_comes_from_the_extra_options_then_the_setting_then_3() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = RuntimeDir::at(tmp.path().join("run")).unwrap();
+        let login = || Login {
+            username: "alice".into(),
+            password: Secret::new("pw"),
+        };
+        let verb_for = |extra: &[&str], setting: Option<u8>| {
+            let loaded = loaded_with(tmp.path(), |s| {
+                s.profile.inline = "client\nremote vpn.example.org 8443 tcp\nverb 1\n".into();
+                s.openvpn.extra_options = extra.iter().map(|e| e.to_string()).collect();
+                s.openvpn.verb = setting;
+            });
+            let prepared = prepare(&loaded, &runtime, login(), None).unwrap();
+            let config = std::fs::read_to_string(&prepared.config_path).unwrap();
+            let added = config
+                .split("added by ovpn-otp")
+                .nth(1)
+                .unwrap()
+                .to_string();
+            assert!(
+                !added.contains("verb"),
+                "a second verb in the config: {added}"
+            );
+            prepared.options.launch.verb
+        };
+        assert_eq!(verb_for(&[], None), 3);
+        assert_eq!(verb_for(&[], Some(5)), 5);
+        assert_eq!(verb_for(&["verb 6"], None), 6);
+        assert_eq!(verb_for(&["--verb", "6"], Some(5)), 6);
+        assert_eq!(verb_for(&["mute 10"], Some(0)), 0);
+    }
+
+    #[test]
+    fn describes_what_a_session_uses() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("work.ovpn"),
+            "client\nproto tcp\nremote vpn.example.org 8443\nremote 10.255.0.1 8443\n",
+        )
+        .unwrap();
+        let loaded = loaded_with(tmp.path(), |s| s.profile.path = "work.ovpn".into());
+        let using = describe(&loaded, " alice ");
+        assert_eq!(using.name, "work");
+        assert_eq!(using.settings, loaded.path.display().to_string());
+        assert_eq!(
+            using.profile,
+            tmp.path().join("work.ovpn").display().to_string()
+        );
+        // The private address is not tried, so it is not shown either.
+        assert_eq!(using.servers, vec!["vpn.example.org:8443 (tcp)"]);
+        assert_eq!(using.username, "alice");
+
+        // The same reaches the session and from there the status file.
+        let runtime = RuntimeDir::at(tmp.path().join("run")).unwrap();
+        let login = Login {
+            username: "alice".into(),
+            password: Secret::new("pw"),
+        };
+        let prepared = prepare(&loaded, &runtime, login, None).unwrap();
+        assert_eq!(prepared.using, using);
+        assert_eq!(
+            prepared.options.connect_timeout,
+            std::time::Duration::from_secs(60)
+        );
+
+        // A profile that is missing or inside the settings file.
+        let missing = loaded_with(tmp.path(), |s| s.profile.path = "gone.ovpn".into());
+        let using = describe(&missing, "");
+        assert!(using.profile.ends_with("gone.ovpn"));
+        assert!(using.servers.is_empty());
+        let inline = loaded_with(tmp.path(), |s| {
+            s.profile.inline = "client\nremote a.example.org 1194\n".into()
+        });
+        let using = describe(&inline, "");
+        assert_eq!(using.profile, "inside the settings file");
+        assert_eq!(using.servers, vec!["a.example.org:1194 (udp)"]);
+        assert_eq!(describe(&loaded_with(tmp.path(), |_| {}), "").profile, "");
     }
 
     #[test]
