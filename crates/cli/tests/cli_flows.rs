@@ -19,9 +19,10 @@ const USER: &str = "name-given-by-the-test";
 
 /// The stand-in `openvpn`, built by `cargo test` next to the test programs.
 fn fake_openvpn() -> PathBuf {
-    let test_exe = std::env::current_exe().unwrap();
-    let debug_dir = test_exe.parent().unwrap().parent().unwrap();
-    let fake = debug_dir.join("examples").join("fake_openvpn");
+    // The examples are built next to the `ovpn-otp` binary. The test program
+    // itself may live in a separate build directory, so do not start from it.
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_ovpn-otp"));
+    let fake = bin.parent().unwrap().join("examples").join("fake_openvpn");
     assert!(
         fake.is_file(),
         "{} is missing. Run the whole test suite of the package (`cargo test -p ovpn-otp`), \
