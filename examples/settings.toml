@@ -1,0 +1,59 @@
+# ovpn-otp settings. No secrets belong in this file: the login is kept in the
+# OS credential store and the authenticator code is typed at connect time.
+#
+# Put this file and your .ovpn profile in a synced folder (or a private git
+# repository) to use the same settings on several machines, and point each
+# machine at it with OVPN_OTP_CONFIG or --config.
+
+# A short name for this connection. The saved login is stored under it.
+name = "work"
+
+[profile]
+# The profile you downloaded from the VPN server's user portal.
+# A relative path is relative to this file.
+path = "work.ovpn"
+# Or paste the profile here instead of `path`:
+# inline = """
+# client
+# ...
+# """
+# Use another server than the profile's `remote` line (host:port):
+# remote = "vpn.example.com:8443"
+
+[keepalive]
+# OpenVPN sends a keep-alive ping every `ping` seconds and restarts the
+# connection when nothing arrives for `ping_restart` seconds. 0 = profile's value.
+ping = 10
+ping_restart = 60
+# Reconnect by itself after a drop. The server needs a fresh code, so you are
+# asked for one.
+auto_reconnect = true
+# Wait between reconnect tries: starts here, doubles each time, up to the max.
+backoff_initial = 2
+backoff_max = 60
+
+[check]
+# A host behind the VPN to check while connected; empty turns it off.
+# "10.0.0.1" uses ping, "10.0.0.1:443" opens a TCP connection.
+host = ""
+interval = 15
+
+[code]
+# Digits in your authenticator code (0 = any length).
+digits = 6
+
+[openvpn]
+# Extra OpenVPN options, appended to the profile.
+extra_options = []
+# verb = 3
+
+[openvpn.windows]
+# path = 'C:\Program Files\OpenVPN\bin\openvpn.exe'
+# "auto" (default), "service" (no admin rights) or "direct" (needs admin).
+launch = ""
+
+[openvpn.linux]
+# path = "/usr/bin/openvpn"
+# How openvpn gets network rights. Default ["sudo", "-n"]; use ["pkexec"]
+# for a password dialog, or [] if the openvpn program already has the rights.
+# command_prefix = ["sudo", "-n"]
