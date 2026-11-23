@@ -1,0 +1,20 @@
+[package]
+name = "ovpn-otp"
+description = "Command-line client for OpenVPN servers that want a one-time code appended to the password"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ovpn-otp"
+path = "src/main.rs"
+
+[dependencies]
+ovpn-otp-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+ctrlc = "3"
+rpassword.workspace = true
+serde_json.workspace = true

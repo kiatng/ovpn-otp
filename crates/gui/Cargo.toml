@@ -1,0 +1,16 @@
+[package]
+name = "ovpn-otp-gui"
+description = "Desktop window for OpenVPN servers that want a one-time code appended to the password"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "ovpn-otp-gui"
+path = "src/main.rs"
+
+[dependencies]
+ovpn-otp-core.workspace = true
+chrono.workspace = true
+eframe.workspace = true
