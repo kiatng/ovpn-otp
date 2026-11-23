@@ -8,9 +8,9 @@ use std::collections::VecDeque;
 use chrono::{DateTime, Local, TimeZone};
 use serde::{Deserialize, Serialize};
 
-use crate::mgmt::{LogEntry, LogLevel};
+use crate::mgmt::{self, LogEntry, LogLevel};
 use crate::reach::ReachResult;
-use crate::session::{CodeReason, Direction, EndReason, Event};
+use crate::session::{self, CodeReason, Direction, EndReason, Event, FailureKind};
 
 const MAX_TIMELINE: usize = 300;
 const MAX_LOG: usize = 3000;
@@ -18,6 +18,7 @@ const MAX_WIRE: usize = 3000;
 
 /// The overall situation, in plain terms.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Phase {
     #[default]
     Idle,
@@ -78,6 +79,8 @@ pub struct WireLine {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub phase: Phase,
+    /// When the session entered the current phase.
+    pub phase_since: Option<DateTime<Local>>,
     /// OpenVPN's own state name (`CONNECTED`, `WAIT`, ...).
     pub state: String,
     pub state_detail: String,
@@ -99,6 +102,9 @@ pub struct Snapshot {
     pub code_reason: Option<CodeReason>,
     pub reconnect_attempt: u32,
     pub next_retry: Option<DateTime<Local>>,
+    /// Why the last try failed, until the session connects.
+    pub failure: Option<FailureKind>,
+    /// The message that goes with `failure`, until the session connects.
     pub last_error: Option<String>,
     pub ended: Option<EndReason>,
     #[serde(skip)]
@@ -126,6 +132,14 @@ fn ts(secs: i64) -> DateTime<Local> {
 impl Snapshot {
     /// Fold one event in.
     pub fn apply(&mut self, ev: &Event) {
+        let before = self.phase;
+        self.fold(ev);
+        if self.phase != before || self.phase_since.is_none() {
+            self.phase_since = Some(Local::now());
+        }
+    }
+
+    fn fold(&mut self, ev: &Event) {
         match ev {
             Event::Launching { at, attempt } => {
                 self.phase = Phase::Starting;
@@ -133,6 +147,7 @@ impl Snapshot {
                 self.next_retry = None;
                 if *attempt == 0 {
                     self.last_error = None;
+                    self.failure = None;
                 }
                 self.push_timeline(
                     *at,
@@ -171,6 +186,8 @@ impl Snapshot {
                         self.reconnect_attempt = 0;
                         self.next_retry = None;
                         self.code_reason = None;
+                        self.failure = None;
+                        self.last_error = None;
                         if !info.local_ip.is_empty() {
                             self.local_ip = info.local_ip.clone();
                         }
@@ -222,16 +239,22 @@ impl Snapshot {
                 time,
                 level,
                 message,
-            }) => push_capped(
-                &mut self.logs,
-                LogLine {
-                    at: if *time > 0 { ts(*time) } else { Local::now() },
-                    level: *level,
-                    source: "openvpn".into(),
-                    message: message.clone(),
-                },
-                MAX_LOG,
-            ),
+            }) => {
+                // The server being tried, before OpenVPN reports it in a state.
+                if let Some(remote) = mgmt::parse_link_remote(message) {
+                    self.server = remote;
+                }
+                push_capped(
+                    &mut self.logs,
+                    LogLine {
+                        at: if *time > 0 { ts(*time) } else { Local::now() },
+                        level: *level,
+                        source: "openvpn".into(),
+                        message: message.clone(),
+                    },
+                    MAX_LOG,
+                )
+            }
             Event::Note { at, level, text } => {
                 if *level >= LogLevel::Error {
                     self.last_error = Some(text.clone());
@@ -248,6 +271,7 @@ impl Snapshot {
                         "Login rejected: check the password and enter a new code."
                     }
                     CodeReason::Expired => "The code was too old: enter a new one.",
+                    CodeReason::Retry => "The last try failed: enter a new code to try again.",
                 };
                 self.push_app_log(Local::now(), LogLevel::Warning, text.into());
             }
@@ -259,13 +283,20 @@ impl Snapshot {
                 self.push_timeline(*at, "LOGIN", "login sent".into());
             }
             Event::AuthFailed { reason } => {
-                self.last_error = Some(format!("Login rejected: {reason}"));
+                self.failure = Some(FailureKind::AuthFailed);
+                self.last_error = Some(session::auth_failed_message(reason));
                 self.push_timeline(Local::now(), "AUTH_FAILED", reason.clone());
                 self.push_app_log(
                     Local::now(),
                     LogLevel::Error,
                     format!("Login rejected: {reason}"),
                 );
+            }
+            Event::ConnectFailed { at, failure } => {
+                self.failure = Some(failure.kind);
+                self.last_error = Some(failure.message.clone());
+                self.push_timeline(*at, "FAILED", failure.kind.name().to_string());
+                self.push_app_log(*at, LogLevel::Error, failure.message.clone());
             }
             Event::Pushed(p) => {
                 if !p.routes.is_empty() {
@@ -309,10 +340,22 @@ impl Snapshot {
                 self.rate_out = 0.0;
                 let text = match reason {
                     EndReason::Disconnected => "Disconnected.".to_string(),
-                    EndReason::Dropped(r) => format!("Connection dropped: {r}"),
-                    EndReason::Failed(r) => {
-                        self.last_error = Some(r.clone());
-                        format!("Failed: {r}")
+                    EndReason::Dropped(r) => {
+                        let text = format!("Connection dropped: {r}");
+                        self.failure = Some(FailureKind::Dropped);
+                        self.last_error = Some(text.clone());
+                        text
+                    }
+                    EndReason::Failed(f) => {
+                        // The message is already in the log when a failed try ended the session.
+                        let said = self.last_error.as_deref() == Some(f.message.as_str());
+                        self.failure = Some(f.kind);
+                        self.last_error = Some(f.message.clone());
+                        if said {
+                            format!("Failed ({}).", f.kind.name())
+                        } else {
+                            format!("Failed: {}", f.message)
+                        }
                     }
                 };
                 let level = if matches!(reason, EndReason::Disconnected) {
@@ -391,6 +434,7 @@ pub fn format_duration(secs: i64) -> String {
 mod tests {
     use super::*;
     use crate::mgmt::StateInfo;
+    use crate::session::Failure;
 
     fn state(name: &str, ip: &str) -> Event {
         Event::State {
@@ -465,11 +509,83 @@ mod tests {
     fn ended_failed_keeps_error() {
         let mut s = Snapshot::default();
         s.apply(&Event::Ended {
-            reason: EndReason::Failed("no openvpn".into()),
+            reason: EndReason::Failed(Failure::other("no openvpn")),
         });
         assert_eq!(s.phase, Phase::Failed);
+        assert_eq!(s.failure, Some(FailureKind::Failed));
         assert_eq!(s.last_error.as_deref(), Some("no openvpn"));
         assert!(!s.phase.is_active());
+    }
+
+    #[test]
+    fn a_failed_try_shows_until_the_session_connects() {
+        let mut s = Snapshot::default();
+        s.apply(&Event::ConnectFailed {
+            at: Local::now(),
+            failure: Failure::new(FailureKind::ServerReset, "closed during login"),
+        });
+        assert_eq!(s.failure, Some(FailureKind::ServerReset));
+        assert_eq!(s.last_error.as_deref(), Some("closed during login"));
+        assert!(s
+            .timeline
+            .iter()
+            .any(|t| t.state == "FAILED" && t.detail == "server_reset"));
+        s.apply(&Event::NeedCode {
+            reason: CodeReason::Retry,
+        });
+        assert_eq!(s.phase, Phase::NeedCode);
+        assert_eq!(s.failure, Some(FailureKind::ServerReset));
+        s.apply(&state("CONNECTED", "10.8.0.6"));
+        assert_eq!(s.failure, None);
+        assert_eq!(s.last_error, None);
+
+        s.apply(&Event::AuthFailed {
+            reason: String::new(),
+        });
+        assert_eq!(s.failure, Some(FailureKind::AuthFailed));
+        assert!(s
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("rejected the login"));
+        s.apply(&Event::Ended {
+            reason: EndReason::Dropped("ping-restart".into()),
+        });
+        assert_eq!(s.phase, Phase::Disconnected);
+        assert_eq!(s.failure, Some(FailureKind::Dropped));
+    }
+
+    #[test]
+    fn tracks_when_the_phase_began_and_the_server_being_tried() {
+        let mut s = Snapshot::default();
+        s.apply(&Event::Launching {
+            at: Local::now(),
+            attempt: 0,
+        });
+        let started = s.phase_since.expect("phase_since is set");
+        s.apply(&Event::Log(LogEntry {
+            time: 0,
+            level: LogLevel::Info,
+            message: "TCP connection established with [AF_INET]203.0.113.10:8443".into(),
+        }));
+        assert_eq!(s.server, "203.0.113.10:8443");
+        assert_eq!(
+            s.phase_since,
+            Some(started),
+            "a log line does not change the phase"
+        );
+        s.apply(&state("WAIT", ""));
+        assert!(s.phase_since.unwrap() >= started);
+        assert_eq!(s.phase, Phase::Connecting);
+    }
+
+    #[test]
+    fn phases_and_reasons_use_fixed_lower_case_names() {
+        assert_eq!(serde_json::to_value(Phase::NeedCode).unwrap(), "need_code");
+        assert_eq!(serde_json::to_value(Phase::Connected).unwrap(), "connected");
+        assert_eq!(serde_json::to_value(CodeReason::Retry).unwrap(), "retry");
+        assert_eq!(serde_json::to_value(LogLevel::Warning).unwrap(), "warning");
+        assert_eq!(serde_json::to_value(Direction::In).unwrap(), "in");
     }
 
     #[test]

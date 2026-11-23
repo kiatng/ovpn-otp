@@ -65,6 +65,9 @@ pub fn bundle(snap: &Snapshot, settings: &Settings, settings_path: &str, usernam
             }
         ));
     }
+    if let Some(kind) = snap.failure {
+        line(format!("failure reason: {}", kind.name()));
+    }
     if let Some(e) = &snap.last_error {
         line(format!("last error: {e}"));
     }

@@ -84,6 +84,7 @@ pub struct LogEntry {
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
 )]
+#[serde(rename_all = "snake_case")]
 pub enum LogLevel {
     Debug,
     Info,
@@ -280,8 +281,12 @@ fn parse_password(body: &str) -> PasswordNotice {
     }
     if let Some(rest) = body.strip_prefix("Verification Failed:") {
         let realm = quoted(rest).unwrap_or_default();
+        // The reason, when the server gave one, follows as ['text'].
         let after = rest.splitn(3, '\'').nth(2).unwrap_or("").trim();
-        let reason = after.trim_matches(|c| c == '[' || c == ']').to_string();
+        let reason = after
+            .trim_matches(|c| c == '[' || c == ']')
+            .trim_matches('\'')
+            .to_string();
         return PasswordNotice::VerificationFailed { realm, reason };
     }
     PasswordNotice::Other(body.to_string())
@@ -380,6 +385,32 @@ pub fn parse_push_reply(message: &str) -> Option<PushReply> {
         }
     }
     Some(reply)
+}
+
+/// The server address in a log line that names the link, as `host:port`.
+///
+/// OpenVPN writes the address as `[AF_INET]203.0.113.10:8443` in lines such as
+/// `TCP connection established with ...`, `... link remote: ...` and
+/// `TCP: connect to ... failed: ...`. Other lines give `None`.
+pub fn parse_link_remote(message: &str) -> Option<String> {
+    let names_link = [
+        "link remote:",
+        "TCP connection established with",
+        "Attempting to establish TCP connection with",
+        "TCP: connect to",
+    ]
+    .iter()
+    .any(|p| message.contains(p));
+    if !names_link {
+        return None;
+    }
+    let rest = &message[message.find("[AF_INET")?..];
+    let addr = rest.split_once(']')?.1;
+    let addr: String = addr
+        .chars()
+        .take_while(|c| !c.is_whitespace() && *c != ',')
+        .collect();
+    (!addr.is_empty()).then_some(addr)
 }
 
 /// `255.255.255.0` -> `24`. Returns the mask unchanged if it is not a dotted mask.
@@ -506,6 +537,45 @@ mod tests {
             parse_line(">PASSWORD:Auth-Token:c2VjcmV0"),
             Line::Notification(Notification::Password(PasswordNotice::AuthToken))
         );
+    }
+
+    #[test]
+    fn parses_the_reason_of_a_rejected_login() {
+        assert_eq!(
+            parse_line(
+                ">PASSWORD:Verification Failed: 'Auth' ['Data channel cipher negotiation failed (no shared cipher)']"
+            ),
+            Line::Notification(Notification::Password(PasswordNotice::VerificationFailed {
+                realm: "Auth".into(),
+                reason: "Data channel cipher negotiation failed (no shared cipher)".into()
+            }))
+        );
+    }
+
+    #[test]
+    fn finds_the_server_address_in_link_lines() {
+        assert_eq!(
+            parse_link_remote("TCP connection established with [AF_INET]203.0.113.10:8443")
+                .as_deref(),
+            Some("203.0.113.10:8443")
+        );
+        assert_eq!(
+            parse_link_remote("TCPv4_CLIENT link remote: [AF_INET]203.0.113.10:8443").as_deref(),
+            Some("203.0.113.10:8443")
+        );
+        assert_eq!(
+            parse_link_remote(
+                "TCP: connect to [AF_INET]10.255.0.1:8443 failed: Connection timed out"
+            )
+            .as_deref(),
+            Some("10.255.0.1:8443")
+        );
+        assert_eq!(
+            parse_link_remote("UDPv6 link remote: [AF_INET6]2001:db8::1:1194").as_deref(),
+            Some("2001:db8::1:1194")
+        );
+        assert_eq!(parse_link_remote("UDPv4 link local: (not bound)"), None);
+        assert_eq!(parse_link_remote("VERIFY OK: depth=0, CN=x"), None);
     }
 
     #[test]

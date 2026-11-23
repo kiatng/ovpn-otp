@@ -1,9 +1,10 @@
 //! End-to-end test against a real OpenVPN server.
 //!
-//! Run through `tests/integration/run.sh`, which creates the server, the
-//! certificates and a private network namespace, then runs this test with
-//! `--ignored`. It proves connect, state, byte counts, a drop with reconnect
-//! (and a fresh code), a rejected code, and disconnect.
+//! Run through `tests/integration/run.sh`, which creates the servers, the
+//! certificates and a private network namespace, then runs these tests with
+//! `--ignored`. They prove connect, state, byte counts, a drop with reconnect
+//! (and a fresh code), a rejected code, and disconnect; a server that only
+//! accepts an old cipher; and a server that closes the connection during login.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -13,7 +14,7 @@ use std::time::{Duration, Instant};
 use ovpn_otp_core::connect;
 use ovpn_otp_core::credentials::{Login, Secret};
 use ovpn_otp_core::runtime::RuntimeDir;
-use ovpn_otp_core::session::{CodeReason, EndReason, Event, SessionHandle};
+use ovpn_otp_core::session::{CodeReason, EndReason, Event, FailureKind, SessionHandle};
 use ovpn_otp_core::settings;
 use ovpn_otp_core::snapshot::{Phase, Snapshot};
 
@@ -220,4 +221,187 @@ command_prefix = []
         let text = format!("{e:?}");
         assert!(!text.contains("letmein"), "password leaked: {text}");
     }
+}
+
+/// Start a session for `profile` (a file `run.sh` wrote), with `extra`
+/// settings lines, the way a script does: a rejected login ends it.
+fn start_session(name: &str, profile: &str, extra: &str) -> (SessionHandle, PathBuf) {
+    let dir = PathBuf::from(env("OVPN_OTP_IT_DIR"));
+    let openvpn = env("OVPN_OTP_IT_OPENVPN");
+    let settings_path = dir.join(format!("{name}-settings.toml"));
+    std::fs::write(
+        &settings_path,
+        format!(
+            r#"name = "{name}"
+[profile]
+path = "{profile}"
+[keepalive]
+ping = 2
+ping_restart = 8
+backoff_initial = 1
+backoff_max = 2
+[openvpn]
+{extra}
+[openvpn.linux]
+path = "{openvpn}"
+command_prefix = []
+"#
+        ),
+    )
+    .unwrap();
+    let loaded = settings::load(&settings_path).unwrap();
+    let runtime = RuntimeDir::at(dir.join(format!("{name}-run"))).unwrap();
+    let login = Login {
+        username: "tester".into(),
+        password: Secret::new("letmein"),
+    };
+    let mut prepared = connect::prepare(&loaded, &runtime, login, Some(CODE.into())).unwrap();
+    prepared.options.retry_login = false;
+    prepared.start()
+}
+
+fn asked_for_a_code(seen: &[Event]) -> bool {
+    seen.iter().any(|e| matches!(e, Event::NeedCode { .. }))
+}
+
+fn log_has(seen: &[Event], text: &str) -> bool {
+    seen.iter()
+        .any(|e| matches!(e, Event::Log(l) if l.message.contains(text)))
+}
+
+/// Watch a session until it ends as failed, and give back the failure.
+fn failed_end(w: &mut Watch) -> ovpn_otp_core::session::Failure {
+    let end = w.until("the end of the session", |e, _| {
+        matches!(e, Event::Ended { .. })
+    });
+    match end {
+        Event::Ended {
+            reason: EndReason::Failed(failure),
+        } => failure,
+        other => panic!("the session did not fail: {other:?}"),
+    }
+}
+
+/// A server that only accepts AES-128-CBC, like an older firewall, and a
+/// profile that names that cipher the old way (`cipher AES-128-CBC`).
+#[test]
+#[ignore = "needs a real OpenVPN server; run tests/integration/run.sh"]
+fn cbc_only_server_needs_the_cipher_lines_ovpn_otp_adds() {
+    // Without the added lines (here taken away again through extra_options),
+    // OpenVPN offers only its own ciphers and the server refuses the client
+    // right after the TLS handshake. That is the failure being fixed.
+    let (h, config_path) = start_session(
+        "it-cbc-unfixed",
+        "client-cbc.ovpn",
+        r#"extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"]"#,
+    );
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(!text.contains("data-ciphers-fallback"), "{text}");
+    let mut w = Watch {
+        h: &h,
+        snap: Snapshot::default(),
+        seen: Vec::new(),
+    };
+    let failure = failed_end(&mut w);
+    assert_eq!(failure.kind, FailureKind::CipherMismatch, "{failure:?}");
+    assert!(failure.message.contains("no shared cipher"), "{failure:?}");
+    assert!(
+        log_has(&w.seen, "VERIFY OK"),
+        "the TLS handshake did not happen"
+    );
+    assert!(!asked_for_a_code(&w.seen), "asked for another code");
+    assert_eq!(w.snap.phase, Phase::Failed);
+    drop(w);
+    h.join();
+    let _ = std::fs::remove_file(config_path);
+
+    // With the profile as exported and no extra settings, it connects, and
+    // the data channel uses the cipher the profile names.
+    let (h, config_path) = start_session("it-cbc", "client-cbc.ovpn", "");
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains(
+            "data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-128-CBC\n\
+             data-ciphers-fallback AES-128-CBC\n"
+        ),
+        "{text}"
+    );
+    assert!(!text.contains("disable-dco"), "{text}");
+    let mut w = Watch {
+        h: &h,
+        snap: Snapshot::default(),
+        seen: Vec::new(),
+    };
+    w.until("CONNECTED to the CBC-only server", connected);
+    assert_eq!(w.snap.phase, Phase::Connected);
+    assert_eq!(w.snap.failure, None);
+    assert!(
+        w.snap.local_ip.starts_with("10.91.0."),
+        "ip {}",
+        w.snap.local_ip
+    );
+    // OpenVPN names the cipher of the data channel in its log, around the
+    // time it reports CONNECTED.
+    let names_cipher =
+        |m: &str| m.contains("Cipher 'AES-128-CBC'") || m.contains("cipher 'AES-128-CBC'");
+    if !w.snap.logs.iter().any(|l| names_cipher(&l.message)) {
+        w.until(
+            "AES-128-CBC on the data channel",
+            |e, _| matches!(e, Event::Log(l) if names_cipher(&l.message)),
+        );
+    }
+    assert!(
+        !log_has(&w.seen, "DEPRECATED OPTION: --cipher"),
+        "OpenVPN still warns about the cipher line"
+    );
+    assert!(w.seen.iter().any(
+        |e| matches!(e, Event::Note { text, .. } if text.contains("data-ciphers-fallback AES-128-CBC"))
+    ));
+    h.disconnect();
+    w.until("end", |e, _| matches!(e, Event::Ended { .. }));
+    drop(w);
+    h.join();
+    let _ = std::fs::remove_file(config_path);
+}
+
+/// The server closes the connection during login and says nothing: OpenVPN
+/// reports "Connection reset, restarting" right after the TLS handshake. The
+/// session must end with that reason instead of asking for another code.
+#[test]
+#[ignore = "needs a real OpenVPN server; run tests/integration/run.sh"]
+fn connection_reset_during_login_ends_with_server_reset() {
+    let (h, config_path) = start_session("it-reset", "client-reset.ovpn", "");
+    let mut w = Watch {
+        h: &h,
+        snap: Snapshot::default(),
+        seen: Vec::new(),
+    };
+    let failure = failed_end(&mut w);
+    assert_eq!(failure.kind, FailureKind::ServerReset, "{failure:?}");
+    for cause in [
+        "127.0.0.1:11944",
+        "code was wrong",
+        "password is wrong",
+        "cipher mismatch",
+    ] {
+        assert!(
+            failure.message.contains(cause),
+            "`{cause}` not in {failure:?}"
+        );
+    }
+    assert!(
+        log_has(&w.seen, "VERIFY OK"),
+        "the TLS handshake did not happen"
+    );
+    assert!(log_has(&w.seen, "Connection reset, restarting"));
+    assert!(!asked_for_a_code(&w.seen), "asked for another code");
+    assert_eq!(w.snap.phase, Phase::Failed);
+    assert_eq!(w.snap.failure, Some(FailureKind::ServerReset));
+    for e in &w.seen {
+        let text = format!("{e:?}");
+        assert!(!text.contains("letmein"), "password leaked: {text}");
+    }
+    drop(w);
+    h.join();
+    let _ = std::fs::remove_file(config_path);
 }

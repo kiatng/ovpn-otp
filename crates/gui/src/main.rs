@@ -246,6 +246,10 @@ impl App {
         if run.recorder.dir().take_stop_request() {
             run.handle.disconnect();
         }
+        // A code from `ovpn-otp code`.
+        if let Some(code) = run.recorder.dir().take_code() {
+            run.handle.send_code(&code);
+        }
         run.recorder.write_status(&self.snap, !ended, ended);
         if need_code {
             self.focus_code = true;
@@ -323,6 +327,7 @@ impl App {
             Some(CodeReason::Reconnect) if waiting => "Reconnecting: enter a new code",
             Some(CodeReason::Rejected) if waiting => "Login rejected: enter a new code",
             Some(CodeReason::Expired) if waiting => "Code too old: enter a new code",
+            Some(CodeReason::Retry) if waiting => "The last try failed: enter a new code",
             _ if waiting => "The server is waiting for your code",
             _ => "Authenticator code",
         };
@@ -634,6 +639,10 @@ impl App {
                 ui.label("Server override");
                 ui.add(egui::TextEdit::singleline(&mut e.profile.remote).hint_text("host:port, empty = use the profile"));
                 ui.end_row();
+                ui.label("Private server addresses");
+                ui.checkbox(&mut e.profile.allow_private_remotes, "Also try them when the profile has a public one")
+                    .on_hover_text("Addresses such as 10.x.x.x or 192.168.x.x only answer inside that network. Off: they are skipped, so a failed try does not wait on them.");
+                ui.end_row();
                 ui.label("Keep-alive ping (s)");
                 ui.add(egui::DragValue::new(&mut e.keepalive.ping).range(0..=3600))
                     .on_hover_text("OpenVPN sends a ping this often. 0 = use the profile's value.");
@@ -684,7 +693,7 @@ impl App {
                     ui.end_row();
                 }
                 ui.label("Extra OpenVPN options");
-                ui.add(egui::TextEdit::multiline(&mut self.extra_text).desired_rows(2).hint_text("one per line"));
+                ui.add(egui::TextEdit::multiline(&mut self.extra_text).desired_rows(2).hint_text("one per line, like: verb 4"));
                 ui.end_row();
             });
             ui.add_space(8.0);
@@ -728,6 +737,10 @@ impl App {
             .filter(|l| !l.is_empty())
             .map(str::to_string)
             .collect();
+        if let Err(e) = ovpn_otp_core::profile::extra_option_lines(&s.openvpn.extra_options) {
+            self.message = Some((true, e.to_string()));
+            return;
+        }
         match settings::save(&self.loaded.path, &s) {
             Ok(()) => {
                 let renamed = s.name != self.loaded.settings.name;

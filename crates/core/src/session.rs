@@ -19,6 +19,16 @@
 //! session releases it after a backoff delay that doubles on each try. If the
 //! OpenVPN process itself ends unexpectedly after having connected, the
 //! session starts a new one after the same backoff.
+//!
+//! How a failed try is handled: when a try ends before the tunnel is up, the
+//! session works out why (see [`FailureKind`]) and says so with
+//! [`Event::ConnectFailed`] or [`Event::AuthFailed`]. A first connect that
+//! fails ends the session with that reason, so nobody is asked for code after
+//! code while the real problem is somewhere else. Two cases keep going: a
+//! server that could not be reached while the profile has more servers to
+//! try, and a rejected login when [`SessionOptions::retry_login`] is on. After
+//! the tunnel has been up once, the session keeps trying and asks for a new
+//! code with [`CodeReason::Retry`].
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -57,10 +67,22 @@ pub struct SessionOptions {
     pub keepalive: KeepAlive,
     pub reach: ReachCheck,
     pub launch: LaunchRequest,
+    /// When the server rejects the first login, ask for a new code and try
+    /// again (for a person at the window or terminal). When off, the session
+    /// ends with [`FailureKind::AuthFailed`] (for scripts).
+    pub retry_login: bool,
+    /// The servers OpenVPN will try, as `host:port`, for messages.
+    pub remotes: Vec<String>,
+    /// How many servers OpenVPN tries before it starts over. A first connect
+    /// gives up as unreachable after this many tries.
+    pub remote_count: usize,
+    /// Changes made to the profile, logged when the session starts.
+    pub notes: Vec<String>,
 }
 
 /// Which way a management line went.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Direction {
     /// From OpenVPN to this app.
     In,
@@ -70,6 +92,7 @@ pub enum Direction {
 
 /// Why a code is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CodeReason {
     /// First login and no code was given.
     Initial,
@@ -79,6 +102,62 @@ pub enum CodeReason {
     Rejected,
     /// The code waiting to be used was too old.
     Expired,
+    /// The last try to reconnect failed (see the error with it), and the code
+    /// it used cannot be used again.
+    Retry,
+}
+
+/// Why a try to connect failed, as a short fixed name that scripts can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FailureKind {
+    /// The server said the user name, password or code is wrong.
+    AuthFailed,
+    /// The server closed the connection during login without giving a reason.
+    ServerReset,
+    /// The server and OpenVPN have no data cipher in common.
+    CipherMismatch,
+    /// No server answered: wrong address, no network, or a firewall in between.
+    Unreachable,
+    /// A working connection dropped and auto-reconnect is off.
+    Dropped,
+    /// Anything else, such as OpenVPN not starting.
+    Failed,
+}
+
+impl FailureKind {
+    /// The name used in `status --json` and in the log.
+    pub fn name(self) -> &'static str {
+        match self {
+            FailureKind::AuthFailed => "auth_failed",
+            FailureKind::ServerReset => "server_reset",
+            FailureKind::CipherMismatch => "cipher_mismatch",
+            FailureKind::Unreachable => "unreachable",
+            FailureKind::Dropped => "dropped",
+            FailureKind::Failed => "failed",
+        }
+    }
+}
+
+/// A failed try: what kind, and a message for the user.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Failure {
+    pub kind: FailureKind,
+    pub message: String,
+}
+
+impl Failure {
+    pub fn new(kind: FailureKind, message: impl Into<String>) -> Failure {
+        Failure {
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// A failure with no more specific kind.
+    pub fn other(message: impl Into<String>) -> Failure {
+        Failure::new(FailureKind::Failed, message)
+    }
 }
 
 /// How a session ended.
@@ -89,7 +168,7 @@ pub enum EndReason {
     /// The connection dropped and auto-reconnect is off.
     Dropped(String),
     /// Something went wrong that retrying will not fix.
-    Failed(String),
+    Failed(Failure),
 }
 
 /// Something that happened in the session.
@@ -128,6 +207,12 @@ pub enum Event {
     LoginSent { at: DateTime<Local> },
     /// The server rejected the login.
     AuthFailed { reason: String },
+    /// A try to connect failed for another reason than a rejected login:
+    /// the server closed the connection, did not answer, or shares no cipher.
+    ConnectFailed {
+        at: DateTime<Local>,
+        failure: Failure,
+    },
     /// Options the server pushed (routes, DNS, address).
     Pushed(PushReply),
     /// The OpenVPN version line.
@@ -249,7 +334,7 @@ pub fn start(opts: SessionOptions, launcher: Box<dyn Launcher>) -> SessionHandle
 enum ProcessEnd {
     UserStop,
     Dropped(String),
-    Fatal(String),
+    Fatal(Failure),
 }
 
 /// What a multi-line reply belongs to.
@@ -279,8 +364,27 @@ struct Engine {
     /// `Some` while OpenVPN waits for a login; holds the static-challenge info.
     awaiting_login: Option<Option<StaticChallenge>>,
     last_login_rejected: bool,
+    /// The last try to reconnect failed, so the next code request says so.
+    retry_after_failure: bool,
     attempt: u32,
     ever_connected: bool,
+    /// Tries in a row, on a first connect, where no server answered.
+    unreachable_tries: u32,
+
+    // State of the current try, reset when the hold is released.
+    /// The server answered (OpenVPN reached `AUTH`), so the login may have been sent to it.
+    reached_auth: bool,
+    /// The code handed to OpenVPN for this try, kept until it is known whether
+    /// it left this machine. A code the server never saw can be used again.
+    sent_code: Option<(String, Instant)>,
+    /// A log line that says no cipher could be agreed.
+    cipher_error: Option<String>,
+    /// The reason the server gave when it rejected the login.
+    auth_reason: Option<String>,
+    /// The last log line that explains why a try failed.
+    last_problem: Option<String>,
+    /// The server address of the current try, from the log.
+    current_remote: String,
 
     // Per-process state, reset by `run_process`.
     gen: u64,
@@ -294,6 +398,10 @@ struct Engine {
     reach_running: bool,
     stopping: bool,
     drop_reason: Option<String>,
+    /// OpenVPN is being stopped because a try failed in a way that retrying will not fix.
+    end_failure: Option<Failure>,
+    /// Why OpenVPN said it was exiting by itself.
+    exit_failure: Option<Failure>,
     stop_deadline: Option<Instant>,
     fatal: Option<String>,
     last_reconnect_reason: String,
@@ -321,8 +429,16 @@ impl Engine {
             pending_code,
             awaiting_login: None,
             last_login_rejected: false,
+            retry_after_failure: false,
             attempt: 0,
             ever_connected: false,
+            unreachable_tries: 0,
+            reached_auth: false,
+            sent_code: None,
+            cipher_error: None,
+            auth_reason: None,
+            last_problem: None,
+            current_remote: String::new(),
             gen: 0,
             writer: None,
             pending: VecDeque::new(),
@@ -334,6 +450,8 @@ impl Engine {
             reach_running: false,
             stopping: false,
             drop_reason: None,
+            end_failure: None,
+            exit_failure: None,
             stop_deadline: None,
             fatal: None,
             last_reconnect_reason: String::new(),
@@ -353,10 +471,13 @@ impl Engine {
     }
 
     fn run(&mut self) -> EndReason {
+        for text in self.opts.notes.clone() {
+            self.note(LogLevel::Info, text);
+        }
         loop {
             match self.run_process() {
                 ProcessEnd::UserStop => return EndReason::Disconnected,
-                ProcessEnd::Fatal(msg) => return EndReason::Failed(msg),
+                ProcessEnd::Fatal(failure) => return EndReason::Failed(failure),
                 ProcessEnd::Dropped(reason) => {
                     if !self.opts.keepalive.auto_reconnect {
                         return EndReason::Dropped(reason);
@@ -407,9 +528,20 @@ impl Engine {
         self.next_reach_at = None;
         self.stopping = false;
         self.drop_reason = None;
+        self.end_failure = None;
+        self.exit_failure = None;
         self.stop_deadline = None;
         self.fatal = None;
         self.awaiting_login = None;
+        self.reset_try_state();
+    }
+
+    /// Forget what the last try found out, before the next one starts.
+    fn reset_try_state(&mut self) {
+        self.reached_auth = false;
+        self.cipher_error = None;
+        self.auth_reason = None;
+        self.last_problem = None;
     }
 
     fn run_process(&mut self) -> ProcessEnd {
@@ -425,7 +557,7 @@ impl Engine {
             description,
         } = match self.launcher.launch(&self.opts.launch) {
             Ok(l) => l,
-            Err(e) => return ProcessEnd::Fatal(e.to_string()),
+            Err(e) => return ProcessEnd::Fatal(Failure::other(e.to_string())),
         };
         self.note(LogLevel::Info, format!("Started: {description}"));
 
@@ -436,15 +568,18 @@ impl Engine {
                 break s;
             }
             if let Some(code) = process.try_wait() {
-                return ProcessEnd::Fatal(exit_message(code, &process.output_tail()));
+                return ProcessEnd::Fatal(Failure::other(exit_message(
+                    code,
+                    &process.output_tail(),
+                )));
             }
             if Instant::now() > deadline {
                 process.kill();
-                return ProcessEnd::Fatal(format!(
+                return ProcessEnd::Fatal(Failure::other(format!(
                     "OpenVPN did not open its management interface within {}s.{}",
                     MGMT_CONNECT_TIMEOUT.as_secs(),
                     tail_text(&process.output_tail())
-                ));
+                )));
             }
             match self.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(Input::Cmd(Command::Disconnect)) => {
@@ -460,7 +595,7 @@ impl Engine {
             Ok(w) => self.writer = Some(w),
             Err(e) => {
                 process.kill();
-                return ProcessEnd::Fatal(format!("management connection: {e}"));
+                return ProcessEnd::Fatal(Failure::other(format!("management connection: {e}")));
             }
         }
         spawn_reader(stream, self.gen, self.tx.clone());
@@ -493,7 +628,7 @@ impl Engine {
                     if self.stopping {
                         process.kill();
                         self.drop_reason = None;
-                        return ProcessEnd::UserStop;
+                        return self.stop_end();
                     }
                     self.note(LogLevel::Info, "Disconnecting.");
                     self.stopping = true;
@@ -521,6 +656,9 @@ impl Engine {
     }
 
     fn stop_end(&mut self) -> ProcessEnd {
+        if let Some(failure) = self.end_failure.take() {
+            return ProcessEnd::Fatal(failure);
+        }
         match self.drop_reason.take() {
             Some(reason) => ProcessEnd::Dropped(reason),
             None => ProcessEnd::UserStop,
@@ -543,7 +681,7 @@ impl Engine {
         if let Some(at) = self.hold_release_at {
             if now_i >= at {
                 self.hold_release_at = None;
-                self.send("hold release", Reply::Simple);
+                self.release_hold();
             }
         }
         if let Some(at) = self.next_reach_at {
@@ -582,14 +720,23 @@ impl Engine {
             // A fatal error before ever connecting is a setup problem; retrying
             // will not help. After a good connection it may be passing.
             if !self.ever_connected {
-                return ProcessEnd::Fatal(f);
+                return ProcessEnd::Fatal(Failure::other(f));
             }
             return ProcessEnd::Dropped(f);
         }
         if !self.ever_connected {
-            return ProcessEnd::Fatal(exit_message(code.flatten(), &process.output_tail()));
+            let failure = self.exit_failure.take().unwrap_or_else(|| {
+                Failure::other(exit_message(code.flatten(), &process.output_tail()))
+            });
+            return ProcessEnd::Fatal(failure);
         }
         ProcessEnd::Dropped("OpenVPN exited".into())
+    }
+
+    /// Let OpenVPN start the next try.
+    fn release_hold(&mut self) {
+        self.reset_try_state();
+        self.send("hold release", Reply::Simple);
     }
 
     fn send(&mut self, cmd: &str, kind: Reply) {
@@ -699,6 +846,15 @@ impl Engine {
         if entry.message.starts_with("OpenVPN ") && entry.message.contains(" [") {
             self.emit(Event::Version(entry.message.clone()));
         }
+        if let Some(remote) = mgmt::parse_link_remote(&entry.message) {
+            self.current_remote = remote;
+        }
+        if is_cipher_error(&entry.message) {
+            self.cipher_error = Some(entry.message.clone());
+        }
+        if entry.level >= LogLevel::Error || explains_a_failure(&entry.message) {
+            self.last_problem = Some(entry.message.clone());
+        }
         self.emit(Event::Log(entry));
     }
 
@@ -707,9 +863,11 @@ impl Engine {
             Notification::Info(_) => self.setup(),
             Notification::Hold { .. } => {
                 self.holds += 1;
-                if self.holds == 1 && !self.connected_before_in_process() {
+                if self.stopping {
+                    // OpenVPN is about to be stopped; do not start another try.
+                } else if self.holds == 1 && !self.connected_before_in_process() {
                     // First start of this process: any backoff already happened.
-                    self.send("hold release", Reply::Simple);
+                    self.release_hold();
                 } else {
                     let delay = backoff(&self.opts.keepalive, self.attempt.max(1));
                     self.note(
@@ -745,16 +903,27 @@ impl Engine {
 
     fn on_state(&mut self, info: StateInfo) {
         match info.name.as_str() {
+            "AUTH" | "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => {
+                // The server answered, and the login goes to it now: the code
+                // counts as used from here on.
+                self.reached_auth = true;
+                self.sent_code = None;
+            }
             "CONNECTED" => {
                 self.connected = true;
                 self.ever_connected = true;
                 self.attempt = 0;
+                self.unreachable_tries = 0;
                 self.last_login_rejected = false;
+                self.retry_after_failure = false;
+                self.reached_auth = true;
+                self.sent_code = None;
                 if !self.opts.reach.host.trim().is_empty() {
                     self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
                 }
             }
             "RECONNECTING" => {
+                let was_connected = self.connected;
                 self.connected = false;
                 self.next_reach_at = None;
                 if !self.stopping {
@@ -765,32 +934,160 @@ impl Engine {
                         info.detail.clone()
                     };
                     self.last_reconnect_reason = reason.clone();
-                    if self.opts.keepalive.auto_reconnect || info.detail == "auth-failure" {
-                        self.emit(Event::Reconnecting {
-                            at: now(),
-                            attempt: self.attempt,
-                            delay: backoff(&self.opts.keepalive, self.attempt),
-                            reason,
-                        });
+                    if was_connected {
+                        self.on_drop(reason);
                     } else {
-                        self.note(
-                            LogLevel::Warning,
-                            format!("Connection dropped ({reason}); auto-reconnect is off."),
-                        );
-                        self.stopping = true;
-                        self.drop_reason = Some(reason);
-                        self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
-                        self.send("signal SIGTERM", Reply::Simple);
+                        self.on_failed_try(reason, &info.detail);
                     }
                 }
             }
             "EXITING" => {
+                if !self.stopping && !self.connected && is_failure_detail(&info.detail) {
+                    self.exit_failure = Some(self.classify_try(&info.detail));
+                }
                 self.connected = false;
                 self.next_reach_at = None;
             }
             _ => {}
         }
         self.emit(Event::State { at: now(), info });
+    }
+
+    /// A working connection dropped.
+    fn on_drop(&mut self, reason: String) {
+        self.sent_code = None;
+        if self.opts.keepalive.auto_reconnect {
+            self.emit(Event::Reconnecting {
+                at: now(),
+                attempt: self.attempt,
+                delay: backoff(&self.opts.keepalive, self.attempt),
+                reason,
+            });
+        } else {
+            self.note(
+                LogLevel::Warning,
+                format!("Connection dropped ({reason}); auto-reconnect is off."),
+            );
+            self.stopping = true;
+            self.drop_reason = Some(reason);
+            self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
+            self.send("signal SIGTERM", Reply::Simple);
+        }
+    }
+
+    /// A try ended before the tunnel was up: say why, then give up or go on.
+    fn on_failed_try(&mut self, reason: String, detail: &str) {
+        let failure = self.classify_try(detail);
+        // A code the server never saw has not been used; keep it for the next try.
+        let unused_code = self.sent_code.take().filter(|_| !self.reached_auth);
+        if self.pending_code.is_none() {
+            self.pending_code = unused_code;
+        }
+        // A rejected login was already announced with `AuthFailed`.
+        if failure.kind != FailureKind::AuthFailed {
+            self.emit(Event::ConnectFailed {
+                at: now(),
+                failure: failure.clone(),
+            });
+        }
+        let give_up = if self.ever_connected {
+            // After a good connection the cause may be passing: keep trying.
+            false
+        } else {
+            match failure.kind {
+                FailureKind::AuthFailed => !self.opts.retry_login,
+                FailureKind::Unreachable => {
+                    self.unreachable_tries += 1;
+                    self.unreachable_tries >= self.opts.remote_count.max(1) as u32
+                }
+                _ => true,
+            }
+        };
+        if give_up {
+            self.stopping = true;
+            self.end_failure = Some(failure);
+            self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
+            self.send("signal SIGTERM", Reply::Simple);
+            return;
+        }
+        if !matches!(
+            failure.kind,
+            FailureKind::AuthFailed | FailureKind::Unreachable
+        ) {
+            self.retry_after_failure = true;
+        }
+        self.emit(Event::Reconnecting {
+            at: now(),
+            attempt: self.attempt,
+            delay: backoff(&self.opts.keepalive, self.attempt),
+            reason,
+        });
+    }
+
+    /// Work out why the current try failed, from what OpenVPN reported.
+    ///
+    /// `detail` is the reason OpenVPN gives with `RECONNECTING` or `EXITING`,
+    /// such as `connection-reset`, `auth-failure` or `tls-error`.
+    fn classify_try(&self, detail: &str) -> Failure {
+        let server = if self.current_remote.is_empty() {
+            self.opts.remotes.join(", ")
+        } else {
+            self.current_remote.clone()
+        };
+        let at_server = if server.is_empty() {
+            String::new()
+        } else {
+            format!(" at {server}")
+        };
+        let problem = self
+            .last_problem
+            .as_deref()
+            .map(|p| format!(" OpenVPN said: {p}."))
+            .unwrap_or_default();
+        if let Some(line) = &self.cipher_error {
+            return Failure::new(
+                FailureKind::CipherMismatch,
+                format!(
+                    "The server{at_server} and OpenVPN have no encryption cipher in common. \
+                     OpenVPN said: {line}. Add the cipher that the server uses with [openvpn] \
+                     extra_options, for example \"data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC\"."
+                ),
+            );
+        }
+        if detail == "auth-failure" || self.auth_reason.is_some() {
+            return Failure::new(
+                FailureKind::AuthFailed,
+                auth_failed_message(self.auth_reason.as_deref().unwrap_or("")),
+            );
+        }
+        if !self.reached_auth {
+            return Failure::new(
+                FailureKind::Unreachable,
+                format!(
+                    "Could not reach the VPN server{at_server}.{problem} Check the network \
+                     connection, and the server address and port in the profile."
+                ),
+            );
+        }
+        if detail == "connection-reset" {
+            return Failure::new(
+                FailureKind::ServerReset,
+                format!(
+                    "The server{at_server} closed the connection during login and gave no reason. \
+                     Likely causes: the code was wrong or was already used once (wait for the next \
+                     code), the password is wrong, or the server does not accept the encryption \
+                     cipher that OpenVPN offered (a cipher mismatch)."
+                ),
+            );
+        }
+        let what = if detail.is_empty() {
+            "connection restarted"
+        } else {
+            detail
+        };
+        Failure::other(format!(
+            "The connection to the server{at_server} failed during login ({what}).{problem}"
+        ))
     }
 
     fn on_password(&mut self, p: PasswordNotice) {
@@ -811,7 +1108,14 @@ impl Engine {
                 self.send("signal SIGTERM", Reply::Simple);
             }
             PasswordNotice::VerificationFailed { reason, .. } => {
+                if is_cipher_error(&reason) {
+                    // Not a wrong login: the server refused because no cipher
+                    // matched. `on_failed_try` reports it.
+                    self.cipher_error = Some(reason);
+                    return;
+                }
                 self.last_login_rejected = true;
+                self.auth_reason = Some(reason.clone());
                 self.emit(Event::AuthFailed {
                     reason: if reason.is_empty() {
                         "the server rejected the user name, password or code".into()
@@ -838,7 +1142,7 @@ impl Engine {
             return;
         };
         let fresh = match self.pending_code.take() {
-            Some((code, at)) if at.elapsed() <= CODE_MAX_AGE => Some(code),
+            Some((code, at)) if at.elapsed() <= CODE_MAX_AGE => Some((code, at)),
             Some(_) => {
                 self.note(LogLevel::Warning, "The code waiting to be used is too old.");
                 self.emit(Event::NeedCode {
@@ -848,9 +1152,11 @@ impl Engine {
             }
             None => None,
         };
-        let Some(code) = fresh else {
+        let Some((code, typed_at)) = fresh else {
             let reason = if self.last_login_rejected {
                 CodeReason::Rejected
+            } else if self.retry_after_failure {
+                CodeReason::Retry
             } else if self.ever_connected || self.attempt > 0 {
                 CodeReason::Reconnect
             } else {
@@ -877,6 +1183,9 @@ impl Engine {
             "password \"Auth\" \"********\" (password + code, hidden)"
         };
         self.send_raw(pass_cmd.expose(), shown, Reply::Simple);
+        self.sent_code = Some((code, typed_at));
+        self.last_login_rejected = false;
+        self.retry_after_failure = false;
         self.emit(Event::LoginSent { at: now() });
     }
 }
@@ -940,6 +1249,54 @@ pub fn redact_incoming(line: &str) -> String {
     line.to_string()
 }
 
+/// Whether a log line or a server reason says no data cipher could be agreed.
+fn is_cipher_error(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    t.contains("cipher negotiation failed")
+        || t.contains("failed to negotiate cipher")
+        || t.contains("no shared cipher")
+}
+
+/// Whether a log line explains a failed try even though OpenVPN logs it as plain information.
+fn explains_a_failure(message: &str) -> bool {
+    [
+        "TCP: connect to",
+        "RESOLVE: Cannot resolve",
+        "TLS Error",
+        "Connection reset",
+    ]
+    .iter()
+    .any(|p| message.starts_with(p))
+}
+
+/// Whether the reason OpenVPN gives for exiting means a try failed (rather
+/// than someone stopping it).
+fn is_failure_detail(detail: &str) -> bool {
+    [
+        "auth-failure",
+        "connection-reset",
+        "tls-error",
+        "init_instance",
+        "server_poll",
+        "ping-restart",
+        "process-push-msg-failed",
+    ]
+    .contains(&detail)
+}
+
+/// The message for a login the server rejected.
+pub fn auth_failed_message(reason: &str) -> String {
+    let said = if reason.is_empty() {
+        String::new()
+    } else {
+        format!(" (the server said: {reason})")
+    };
+    format!(
+        "The server rejected the login{said}. Check the code first: wait for a new one in your \
+         authenticator app and try again. If it keeps failing, check the user name and password."
+    )
+}
+
 fn tail_text(tail: &[String]) -> String {
     if tail.is_empty() {
         String::new()
@@ -964,6 +1321,11 @@ fn exit_message(code: Option<i32>, tail: &[String]) -> String {
     } else if joined.contains("Cannot open TUN") || joined.contains("Operation not permitted") {
         msg.push_str(
             "\nOpenVPN has no right to create the tunnel. See the README section on privileges.",
+        );
+    } else if joined.contains("Options error") {
+        msg.push_str(
+            "\nOpenVPN did not accept an option in the profile or in [openvpn] extra_options. \
+             Run `ovpn-otp doctor` to check the extra options.",
         );
     }
     msg.push_str(&tail_text(tail));
@@ -1023,6 +1385,31 @@ mod tests {
     fn explains_sudo_password_failure() {
         let m = exit_message(Some(1), &["sudo: a password is required".into()]);
         assert!(m.contains("sudo wants a password"));
+    }
+
+    #[test]
+    fn explains_a_refused_option() {
+        let m = exit_message(
+            Some(1),
+            &["Options error: Unrecognized option or missing or extra parameter(s) in work.ovpn:113: data-ciphers (2.7.0)".into()],
+        );
+        assert!(m.contains("extra_options"), "{m}");
+        assert!(m.contains("work.ovpn:113"), "{m}");
+    }
+
+    #[test]
+    fn failure_kinds_have_fixed_names() {
+        for (kind, name) in [
+            (FailureKind::AuthFailed, "auth_failed"),
+            (FailureKind::ServerReset, "server_reset"),
+            (FailureKind::CipherMismatch, "cipher_mismatch"),
+            (FailureKind::Unreachable, "unreachable"),
+            (FailureKind::Dropped, "dropped"),
+            (FailureKind::Failed, "failed"),
+        ] {
+            assert_eq!(kind.name(), name);
+            assert_eq!(serde_json::to_value(kind).unwrap(), name);
+        }
     }
 
     #[test]

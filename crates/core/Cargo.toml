@@ -26,4 +26,5 @@ keyring = { workspace = true, features = ["async-secret-service", "async-io", "c
 keyring = { workspace = true, features = ["apple-native"] }
 
 [dev-dependencies]
+ovpn-otp-testkit.workspace = true
 tempfile.workspace = true

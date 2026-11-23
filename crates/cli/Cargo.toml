@@ -15,6 +15,12 @@ ovpn-otp-core.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-ctrlc = "3"
+# "termination": SIGTERM and SIGHUP stop the session like Ctrl+C does, so that
+# OpenVPN is not left running when a background session is told to end.
+ctrlc = { version = "3", features = ["termination"] }
 rpassword.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+ovpn-otp-testkit.workspace = true
+tempfile.workspace = true

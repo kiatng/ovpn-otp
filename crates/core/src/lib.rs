@@ -9,6 +9,7 @@
 //! * [`session`] — one session: log in, watch, keep alive, reconnect;
 //! * [`snapshot`] — fold session events into the current picture;
 //! * [`runtime`] — files that let other commands see and stop a session;
+//! * [`report`] — the status report and exit codes that scripts read;
 //! * [`diagnostics`] — the "copy diagnostics" report;
 //! * [`connect`] — glue: settings + login + code -> a running session.
 
@@ -19,6 +20,7 @@ pub mod launch;
 pub mod mgmt;
 pub mod profile;
 pub mod reach;
+pub mod report;
 pub mod runtime;
 pub mod session;
 pub mod settings;
