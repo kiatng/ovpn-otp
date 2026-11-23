@@ -1,15 +1,16 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "crates/gui"]
+members = ["crates/core", "crates/cli", "crates/gui", "crates/testkit"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/kiatng/ovpn-otp"
 
 [workspace.dependencies]
 ovpn-otp-core = { path = "crates/core" }
+ovpn-otp-testkit = { path = "crates/testkit" }
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }

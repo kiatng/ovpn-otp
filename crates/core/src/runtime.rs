@@ -4,10 +4,13 @@
 //! `ovpn-otp connect`) writes the files below into a private folder, and
 //! `ovpn-otp status`, `logs` and `disconnect` read or drop files there:
 //!
-//! * `status.json` — the current [`Snapshot`], rewritten every second;
-//! * `session.log` — the log (OpenVPN, app messages, and the management
-//!   transcript with secrets removed);
+//! * `status.json` — the current [`Snapshot`], rewritten every second and at
+//!   once when the phase changes;
+//! * `session.jsonl` — the log (OpenVPN, app messages, and the management
+//!   transcript with secrets removed), one [`LogRecord`] as JSON per line;
 //! * `stop` — created by `ovpn-otp disconnect`; the session sees it and stops;
+//! * `code` — created by `ovpn-otp code`; the session reads the code, deletes
+//!   the file at once and uses the code for the next login;
 //! * `<name>.ovpn` — the prepared profile, removed when the session ends.
 
 use std::fs::{File, OpenOptions};
@@ -18,8 +21,10 @@ use std::time::{Duration, Instant};
 use chrono::{DateTime, Local};
 use serde::{Deserialize, Serialize};
 
+use crate::launch::write_private;
+use crate::mgmt::LogLevel;
 use crate::session::{Direction, EndReason, Event};
-use crate::snapshot::Snapshot;
+use crate::snapshot::{Phase, Snapshot};
 
 /// Environment variable that overrides the runtime folder.
 pub const RUNTIME_ENV: &str = "OVPN_OTP_RUNTIME_DIR";
@@ -95,10 +100,43 @@ impl RuntimeDir {
         self.path.join("status.json")
     }
     pub fn log_path(&self) -> PathBuf {
-        self.path.join("session.log")
+        self.path.join("session.jsonl")
     }
     pub fn stop_path(&self) -> PathBuf {
         self.path.join("stop")
+    }
+    pub fn code_path(&self) -> PathBuf {
+        self.path.join("code")
+    }
+
+    /// The log of the current (or last) session, oldest line first.
+    pub fn read_log(&self) -> Vec<LogRecord> {
+        std::fs::read_to_string(self.log_path())
+            .map(|text| text.lines().filter_map(LogRecord::from_json).collect())
+            .unwrap_or_default()
+    }
+
+    /// Hand an authenticator code to the running session.
+    ///
+    /// The code is written to a file only the current user can read, and the
+    /// session deletes it as soon as it has read it.
+    pub fn submit_code(&self, code: &str) -> std::io::Result<()> {
+        let tmp = self.path.join("code.tmp");
+        write_private(&tmp, code.as_bytes())?;
+        std::fs::rename(&tmp, self.code_path())
+    }
+
+    /// The code someone handed in with [`RuntimeDir::submit_code`], once.
+    pub fn take_code(&self) -> Option<String> {
+        let path = self.code_path();
+        let code = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        Some(code.trim().to_string()).filter(|c| !c.is_empty())
+    }
+
+    /// True while a handed-in code has not been read by the session yet.
+    pub fn code_waiting(&self) -> bool {
+        self.code_path().exists()
     }
 
     pub fn read_status(&self) -> Option<StatusFile> {
@@ -130,12 +168,14 @@ pub struct Recorder {
     settings: String,
     log: Option<File>,
     last_write: Option<Instant>,
+    last_phase: Option<Phase>,
 }
 
 impl Recorder {
-    /// Start recording. Clears any old stop request and starts a fresh log.
+    /// Start recording. Clears any old stop request or code and starts a fresh log.
     pub fn new(dir: RuntimeDir, name: &str, settings_path: &Path) -> Recorder {
         let _ = std::fs::remove_file(dir.stop_path());
+        let _ = std::fs::remove_file(dir.code_path());
         let log = OpenOptions::new()
             .create(true)
             .write(true)
@@ -148,6 +188,7 @@ impl Recorder {
             settings: settings_path.display().to_string(),
             log,
             last_write: None,
+            last_phase: None,
         }
     }
 
@@ -157,15 +198,19 @@ impl Recorder {
 
     /// Append an event to the log file, if it is worth a line.
     pub fn record(&mut self, ev: &Event) {
-        let Some(line) = log_line(ev) else { return };
-        if let Some(f) = self.log.as_mut() {
+        let Some(record) = log_record(ev) else { return };
+        if let (Some(f), Ok(line)) = (self.log.as_mut(), serde_json::to_string(&record)) {
             let _ = writeln!(f, "{line}");
         }
     }
 
-    /// Rewrite `status.json`, at most once a second unless `force`.
+    /// Rewrite `status.json`: at once when the phase changed or with `force`,
+    /// else at most once a second. Other commands wait on the phase, so a
+    /// change must not sit unwritten.
     pub fn write_status(&mut self, snap: &Snapshot, running: bool, force: bool) {
-        if !force {
+        let phase_changed = self.last_phase != Some(snap.phase);
+        self.last_phase = Some(snap.phase);
+        if !force && !phase_changed {
             if let Some(t) = self.last_write {
                 if t.elapsed() < Duration::from_secs(1) {
                     return;
@@ -190,91 +235,142 @@ impl Recorder {
     }
 }
 
-/// One log-file line for an event. Every text here is already free of secrets.
-pub fn log_line(ev: &Event) -> Option<String> {
-    let stamp = |t: &DateTime<Local>| t.format("%Y-%m-%d %H:%M:%S").to_string();
+/// One line of the session log.
+///
+/// This is also what `ovpn-otp logs --json` prints, so the field names are fixed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogRecord {
+    pub at: DateTime<Local>,
+    /// `openvpn` (the OpenVPN log), `app` (this program), `state` (an OpenVPN
+    /// state change), `check` (the reach check) or `wire` (the management
+    /// transcript).
+    pub source: String,
+    pub level: LogLevel,
+    /// For `wire` lines: `in` from OpenVPN, `out` to OpenVPN.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dir: Option<Direction>,
+    pub message: String,
+}
+
+impl LogRecord {
+    fn new(at: DateTime<Local>, source: &str, level: LogLevel, message: String) -> LogRecord {
+        LogRecord {
+            at,
+            source: source.to_string(),
+            level,
+            dir: None,
+            message,
+        }
+    }
+
+    pub fn from_json(line: &str) -> Option<LogRecord> {
+        serde_json::from_str(line).ok()
+    }
+
+    pub fn is_wire(&self) -> bool {
+        self.source == "wire"
+    }
+
+    /// The line as people read it: time, source, level, message.
+    pub fn to_text(&self) -> String {
+        let stamp = self.at.format("%Y-%m-%d %H:%M:%S");
+        let level = match self.dir {
+            Some(Direction::In) => "<-",
+            Some(Direction::Out) => "->",
+            None => self.level.label(),
+        };
+        format!("{stamp} {:<7} {level:<7} {}", self.source, self.message)
+    }
+}
+
+/// The log line for an event, if it is worth one. Every text here is already
+/// free of secrets.
+pub fn log_record(ev: &Event) -> Option<LogRecord> {
+    use LogLevel::{Error, Info, Warning};
+    let now = Local::now;
     Some(match ev {
-        Event::Launching { at, attempt } => {
-            format!(
-                "{} app     info    starting OpenVPN (try {})",
-                stamp(at),
-                attempt + 1
-            )
-        }
-        Event::Wire { at, dir, text } => {
-            let arrow = match dir {
-                Direction::In => "<-",
-                Direction::Out => "->",
-            };
-            format!("{} wire    {arrow}      {text}", stamp(at))
-        }
-        Event::State { at, info } => format!(
-            "{} state   {:<7} {} {} {}",
-            stamp(at),
-            "info",
-            info.name,
-            info.detail,
-            info.local_ip
-        )
-        .trim_end()
-        .to_string(),
+        Event::Launching { at, attempt } => LogRecord::new(
+            *at,
+            "app",
+            Info,
+            format!("starting OpenVPN (try {})", attempt + 1),
+        ),
+        Event::Wire { at, dir, text } => LogRecord {
+            dir: Some(*dir),
+            ..LogRecord::new(*at, "wire", LogLevel::Debug, text.clone())
+        },
+        Event::State { at, info } => LogRecord::new(
+            *at,
+            "state",
+            Info,
+            format!("{} {} {}", info.name, info.detail, info.local_ip)
+                .trim_end()
+                .to_string(),
+        ),
         Event::Bytes { .. } | Event::Version(_) | Event::Pushed(_) => return None,
         Event::Log(e) => {
             let at = chrono::TimeZone::timestamp_opt(&Local, e.time, 0)
                 .single()
-                .unwrap_or_else(Local::now);
-            format!(
-                "{} openvpn {:<7} {}",
-                stamp(&at),
-                e.level.label(),
-                e.message
-            )
+                .filter(|_| e.time > 0)
+                .unwrap_or_else(now);
+            LogRecord::new(at, "openvpn", e.level, e.message.clone())
         }
-        Event::Note { at, level, text } => {
-            format!("{} app     {:<7} {text}", stamp(at), level.label())
-        }
-        Event::NeedCode { reason } => format!(
-            "{} app     warning waiting for authenticator code ({reason:?})",
-            stamp(&Local::now())
+        Event::Note { at, level, text } => LogRecord::new(*at, "app", *level, text.clone()),
+        Event::NeedCode { reason } => LogRecord::new(
+            now(),
+            "app",
+            Warning,
+            format!("waiting for authenticator code ({reason:?})"),
         ),
-        Event::LoginSent { at } => format!("{} app     info    login sent", stamp(at)),
-        Event::AuthFailed { reason } => format!(
-            "{} app     error   login rejected: {reason}",
-            stamp(&Local::now())
+        Event::LoginSent { at } => LogRecord::new(*at, "app", Info, "login sent".into()),
+        Event::AuthFailed { reason } => {
+            LogRecord::new(now(), "app", Error, format!("login rejected: {reason}"))
+        }
+        Event::ConnectFailed { at, failure } => LogRecord::new(
+            *at,
+            "app",
+            Error,
+            format!("{}: {}", failure.kind.name(), failure.message),
         ),
         Event::Reconnecting {
             at,
             attempt,
             delay,
             reason,
-        } => format!(
-            "{} app     warning connection lost ({reason}); try {attempt} in {}s",
-            stamp(at),
-            delay.as_secs()
+        } => LogRecord::new(
+            *at,
+            "app",
+            Warning,
+            format!(
+                "connection lost ({reason}); try {attempt} in {}s",
+                delay.as_secs()
+            ),
         ),
         Event::Reach(r) => match (r.ok, r.latency_ms) {
-            (true, Some(ms)) => format!(
-                "{} check   info    {} reachable in {ms:.1} ms",
-                stamp(&r.at),
-                r.target
+            (true, Some(ms)) => LogRecord::new(
+                r.at,
+                "check",
+                Info,
+                format!("{} reachable in {ms:.1} ms", r.target),
             ),
-            _ => format!(
-                "{} check   warning {} not reachable: {}",
-                stamp(&r.at),
-                r.target,
-                r.error.clone().unwrap_or_default()
+            _ => LogRecord::new(
+                r.at,
+                "check",
+                Warning,
+                format!(
+                    "{} not reachable: {}",
+                    r.target,
+                    r.error.clone().unwrap_or_default()
+                ),
             ),
         },
         Event::Ended { reason } => {
             let text = match reason {
                 EndReason::Disconnected => "disconnected".to_string(),
                 EndReason::Dropped(r) => format!("dropped: {r}"),
-                EndReason::Failed(r) => format!("failed: {r}"),
+                EndReason::Failed(f) => format!("{}: {}", f.kind.name(), f.message),
             };
-            format!(
-                "{} app     info    session ended, {text}",
-                stamp(&Local::now())
-            )
+            LogRecord::new(now(), "app", Info, format!("session ended, {text}"))
         }
     })
 }
@@ -282,7 +378,6 @@ pub fn log_line(ev: &Event) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::snapshot::Phase;
 
     #[test]
     fn status_round_trip_and_stop_request() {
@@ -321,9 +416,74 @@ mod tests {
             bytes_in: 1,
             bytes_out: 1,
         });
+        rec.record(&Event::Wire {
+            at: Local::now(),
+            dir: Direction::Out,
+            text: "hold release".into(),
+        });
         drop(rec);
+        let log = dir.read_log();
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0].source, "app");
+        assert_eq!(log[0].level, crate::mgmt::LogLevel::Info);
+        assert_eq!(log[0].message, "hello");
+        assert!(log[0].to_text().ends_with("app     info    hello"));
+        assert!(log[1].is_wire());
+        assert!(log[1].to_text().ends_with("wire    ->      hold release"));
+
+        // The file is one JSON object per line with fixed field names.
         let text = std::fs::read_to_string(dir.log_path()).unwrap();
-        assert!(text.contains("hello"));
-        assert_eq!(text.lines().count(), 1);
+        let first: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(first["source"], "app");
+        assert_eq!(first["level"], "info");
+        assert_eq!(first["message"], "hello");
+        assert!(first["at"].is_string());
+        assert!(first.get("dir").is_none());
+        let second: serde_json::Value = serde_json::from_str(text.lines().nth(1).unwrap()).unwrap();
+        assert_eq!(second["dir"], "out");
+    }
+
+    #[test]
+    fn a_handed_in_code_is_read_once_and_removed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
+        assert_eq!(dir.take_code(), None);
+        dir.submit_code("135790").unwrap();
+        assert!(dir.code_waiting());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dir.code_path())
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert_eq!(dir.take_code().as_deref(), Some("135790"));
+        assert!(!dir.code_waiting());
+        assert_eq!(dir.take_code(), None);
+
+        // A code left over from an earlier session is not used by the next one.
+        dir.submit_code("246802").unwrap();
+        let _rec = Recorder::new(dir.clone(), "w", Path::new("s"));
+        assert_eq!(dir.take_code(), None);
+    }
+
+    #[test]
+    fn status_is_written_at_once_when_the_phase_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
+        let mut rec = Recorder::new(dir.clone(), "w", Path::new("s"));
+        let mut snap = Snapshot::default();
+        snap.phase = Phase::NeedCode;
+        rec.write_status(&snap, true, false);
+        assert_eq!(dir.read_status().unwrap().snapshot.phase, Phase::NeedCode);
+        snap.phase = Phase::Connecting;
+        rec.write_status(&snap, true, false);
+        assert_eq!(dir.read_status().unwrap().snapshot.phase, Phase::Connecting);
+        // Within the same second and phase, nothing is rewritten.
+        snap.bytes_in = 7;
+        rec.write_status(&snap, true, false);
+        assert_eq!(dir.read_status().unwrap().snapshot.bytes_in, 0);
     }
 }

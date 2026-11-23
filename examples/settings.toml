@@ -19,6 +19,10 @@ path = "work.ovpn"
 # """
 # Use another server than the profile's `remote` line (host:port):
 # remote = "vpn.example.com:8443"
+# Some profiles also list the server by its address inside the office network,
+# such as 10.255.0.1. From outside it never answers, so it is skipped when the
+# profile has a public address too. true = try those addresses as well.
+allow_private_remotes = false
 
 [keepalive]
 # OpenVPN sends a keep-alive ping every `ping` seconds and restarts the
@@ -43,7 +47,12 @@ interval = 15
 digits = 6
 
 [openvpn]
-# Extra OpenVPN options, appended to the profile.
+# Extra OpenVPN options, added after the profile. Write one option per item as
+# in an .ovpn file:
+#   extra_options = ["data-ciphers AES-256-GCM:AES-128-CBC", "verb 4"]
+# or as on the openvpn command line, each word its own item:
+#   extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-CBC", "--verb", "4"]
+# `ovpn-otp doctor` shows the lines OpenVPN will get.
 extra_options = []
 # verb = 3
 

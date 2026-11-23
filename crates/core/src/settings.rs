@@ -74,6 +74,11 @@ pub struct ProfileSettings {
     pub inline: String,
     /// Optional `host:port` that replaces the profile's `remote` line.
     pub remote: String,
+    /// Also try `remote` lines that point at a private address (such as
+    /// `10.x.x.x` or `192.168.x.x`) when the profile has a public one too.
+    /// Off by default: from outside the office those addresses do not answer,
+    /// and every try on one costs a long wait.
+    pub allow_private_remotes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -144,7 +149,9 @@ pub struct OpenVpnSettings {
     pub windows: OpenVpnPlatform,
     /// Settings used on Linux.
     pub linux: OpenVpnPlatform,
-    /// Extra lines appended to the profile, one option per line.
+    /// Extra OpenVPN options added after the profile. Write each option as one
+    /// item (`"verb 4"`), or as command-line tokens (`"--verb", "4"`); see
+    /// [`crate::profile::extra_option_lines`].
     pub extra_options: Vec<String>,
     /// OpenVPN log detail, 1 (quiet) to 6 (very detailed). Default 3.
     pub verb: Option<u8>,
