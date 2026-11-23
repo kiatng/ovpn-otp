@@ -395,7 +395,7 @@ When you ask for help, paste the output of **Copy diagnostics** or `ovpn-otp dia
 
 ## Development
 
-The code is a Rust workspace with three crates:
+The code is a Rust workspace with four crates:
 
 - `crates/core`: the library. It holds the settings, the saved login, the profile changes, the management protocol parser, the session that logs in, watches and reconnects, and the status report with the exit codes;
 - `crates/cli`: the `ovpn-otp` command;
