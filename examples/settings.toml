@@ -46,14 +46,23 @@ interval = 15
 # Digits in your authenticator code (0 = any length).
 digits = 6
 
+[connect]
+# Give up a connect that makes no progress for this many seconds, and say
+# where it stuck. OpenVPN gets the same number as its connect-timeout, so it
+# also gives up a server that does not answer after this long.
+# 0 = wait as long as OpenVPN does.
+timeout = 60
+
 [openvpn]
 # Extra OpenVPN options, added after the profile. Write one option per item as
 # in an .ovpn file:
-#   extra_options = ["data-ciphers AES-256-GCM:AES-128-CBC", "verb 4"]
+#   extra_options = ["data-ciphers AES-256-GCM:AES-128-CBC", "mute 10"]
 # or as on the openvpn command line, each word its own item:
-#   extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-CBC", "--verb", "4"]
+#   extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-CBC", "--mute", "10"]
 # `ovpn-otp doctor` shows the lines OpenVPN will get.
 extra_options = []
+# How much OpenVPN logs, from 0 (nothing) to 11; 3 when not set, 4 and up to
+# look for a problem. A "verb 5" in extra_options does the same and wins.
 # verb = 3
 
 [openvpn.windows]

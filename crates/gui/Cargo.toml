@@ -14,3 +14,10 @@ path = "src/main.rs"
 ovpn-otp-core.workspace = true
 chrono.workspace = true
 eframe.workspace = true
+# Only for the `screenshots` feature. eframe already brings this crate in.
+png = { version = "0.18", optional = true }
+
+[features]
+# Lets the window save a picture of itself, for the README (see src/shot.rs).
+# Not turned on in a release build.
+screenshots = ["dep:png"]

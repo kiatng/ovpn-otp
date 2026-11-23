@@ -128,7 +128,10 @@ impl Fake {
 
     /// The link went quiet: OpenVPN restarts in-process and waits at hold.
     pub fn drop_link(&self) {
-        self.send(">STATE:1700000100,RECONNECTING,ping-restart,,,,,");
+        self.send(&format!(
+            ">STATE:{},RECONNECTING,ping-restart,,,,,",
+            unix_now()
+        ));
         self.send(">HOLD:Waiting for hold release:5");
     }
 
@@ -271,7 +274,9 @@ enum Later {
 
 impl Conn<'_> {
     fn write(&mut self, text: &str) {
-        let _ = self.w.write_all(format!("{text}\n").as_bytes());
+        let _ = self
+            .w
+            .write_all(format!("{}\n", stamp_now(text)).as_bytes());
     }
 
     /// Bytes from the socket: `None` when it closed. Without `wait`, an empty
@@ -279,9 +284,11 @@ impl Conn<'_> {
     fn recv(&mut self, wait: bool) -> Option<Vec<u8>> {
         let mut buf = [0u8; 4096];
         if !wait {
-            let _ = self.stream.set_read_timeout(Some(Duration::from_millis(1)));
+            // Not with a read timeout: on Windows a read that timed out
+            // leaves the socket in a state that is not defined.
+            let _ = self.stream.set_nonblocking(true);
             let got = self.stream.read(&mut buf);
-            let _ = self.stream.set_read_timeout(None);
+            let _ = self.stream.set_nonblocking(false);
             return match got {
                 Ok(0) => None,
                 Ok(n) => Some(buf[..n].to_vec()),
@@ -367,6 +374,11 @@ impl Conn<'_> {
         }
     }
 
+    /// A state change, with the time of now as OpenVPN gives it.
+    fn emit_state(&mut self, name: &str, rest: &str) {
+        self.emit(&format!(">STATE:{},{name},{rest}", unix_now()));
+    }
+
     fn process(&mut self, cmd: &str) {
         self.fake
             .shared
@@ -419,7 +431,7 @@ impl Conn<'_> {
             self.later.push_back(Later::Login(unquote(rest)));
         } else if cmd == "signal SIGTERM" {
             self.emit("SUCCESS: signal SIGTERM thrown");
-            self.emit(">STATE:1700000009,EXITING,SIGTERM,,,,,");
+            self.emit_state("EXITING", "SIGTERM,,,,,");
             self.exited.store(true, Ordering::SeqCst);
             let _ = self.w.shutdown(std::net::Shutdown::Both);
             self.done = true;
@@ -432,7 +444,7 @@ impl Conn<'_> {
     fn play_login(&mut self, password: String) {
         let restart = ">HOLD:Waiting for hold release:5";
         let outcome = self.fake.next_outcome();
-        self.emit(">STATE:1700000001,TCP_CONNECT,,,,,,");
+        self.emit_state("TCP_CONNECT", ",,,,,");
         if outcome == Outcome::Hang {
             return;
         }
@@ -441,7 +453,7 @@ impl Conn<'_> {
                 ">LOG:1700000002,N,TCP: connect to [AF_INET]{SERVER} failed: Connection timed out"
             ));
             self.emit(">LOG:1700000002,I,SIGUSR1[connection failed(soft),init_instance] received, process restarting");
-            self.emit(">STATE:1700000002,RECONNECTING,init_instance,,,,,");
+            self.emit_state("RECONNECTING", "init_instance,,,,,");
             self.emit(restart);
             return;
         }
@@ -451,8 +463,8 @@ impl Conn<'_> {
         self.emit(&format!(
             ">LOG:1700000001,I,TCPv4_CLIENT link remote: [AF_INET]{SERVER}"
         ));
-        self.emit(">STATE:1700000001,WAIT,,,,,,");
-        self.emit(">STATE:1700000002,AUTH,,,,,,");
+        self.emit_state("WAIT", ",,,,,");
+        self.emit_state("AUTH", ",,,,,");
         self.emit(">LOG:1700000002,I,VERIFY OK: depth=0, CN=fake-server");
         match outcome {
             Outcome::Unreachable | Outcome::Hang => unreachable!("handled above"),
@@ -461,7 +473,7 @@ impl Conn<'_> {
                 self.emit(
                     ">LOG:1700000002,I,SIGUSR1[soft,connection-reset] received, process restarting",
                 );
-                self.emit(">STATE:1700000002,RECONNECTING,connection-reset,,,,,");
+                self.emit_state("RECONNECTING", "connection-reset,,,,,");
                 self.emit(restart);
             }
             Outcome::NoSharedCipher => {
@@ -470,28 +482,53 @@ impl Conn<'_> {
                     ">LOG:1700000002,I,AUTH: Received control message: AUTH_FAILED,{why}"
                 ));
                 self.emit(&format!(">PASSWORD:Verification Failed: 'Auth' ['{why}']"));
-                self.emit(">STATE:1700000006,RECONNECTING,auth-failure,,,,,");
+                self.emit_state("RECONNECTING", "auth-failure,,,,,");
                 self.emit(restart);
             }
             Outcome::Login if password == *self.fake.accept.lock().unwrap() => {
                 self.emit(">LOG:1700000003,I,PUSH: Received control message: 'PUSH_REPLY,route 10.20.0.0 255.255.0.0,dhcp-option DNS 10.20.0.53,ifconfig 10.8.0.6 255.255.255.0'");
-                self.emit(">STATE:1700000003,GET_CONFIG,,,,,,");
-                self.emit(">STATE:1700000004,ASSIGN_IP,,10.8.0.6,,,,");
-                self.emit(">STATE:1700000004,ADD_ROUTES,,,,,,");
+                self.emit_state("GET_CONFIG", ",,,,,");
+                self.emit_state("ASSIGN_IP", ",10.8.0.6,,,,");
+                self.emit_state("ADD_ROUTES", ",,,,,");
                 let (ip, port) = SERVER.split_once(':').unwrap();
-                self.emit(&format!(
-                    ">STATE:1700000005,CONNECTED,SUCCESS,10.8.0.6,{ip},{port},,"
-                ));
+                self.emit_state("CONNECTED", &format!("SUCCESS,10.8.0.6,{ip},{port},,"));
                 self.emit(">BYTECOUNT:1000,500");
                 self.emit(">BYTECOUNT:5000,900");
             }
             Outcome::Login => {
                 self.emit(">PASSWORD:Verification Failed: 'Auth'");
-                self.emit(">STATE:1700000006,RECONNECTING,auth-failure,,,,,");
+                self.emit_state("RECONNECTING", "auth-failure,,,,,");
                 self.emit(restart);
             }
         }
     }
+}
+
+/// Give a log line the time of now. The lines in this file are written with
+/// the stamp `17000000xx`, in `>LOG:` lines and in the lines of the log history.
+fn stamp_now(text: &str) -> String {
+    let (head, rest) = match text.strip_prefix(">LOG:") {
+        Some(rest) => (">LOG:", rest),
+        None => ("", text),
+    };
+    match rest.split_once(',') {
+        Some((stamp, tail))
+            if stamp.len() == 10
+                && stamp.starts_with("17000000")
+                && stamp.chars().all(|c| c.is_ascii_digit()) =>
+        {
+            format!("{head}{},{tail}", unix_now())
+        }
+        _ => text.to_string(),
+    }
+}
+
+/// Seconds since 1970, as OpenVPN stamps its state lines.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// Undo management quoting: `"a\"b"` -> `a"b`.
@@ -609,6 +646,19 @@ mod tests {
             }
         }
 
+        /// Read until a line with `part` in it has arrived.
+        fn until_has(&mut self, part: &str) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !self.seen.iter().any(|l| l.contains(part)) {
+                assert!(
+                    Instant::now() < deadline,
+                    "no line with `{part}`; got {:#?}",
+                    self.seen
+                );
+                self.settle(Duration::from_millis(20));
+            }
+        }
+
         fn count(&self, prefix: &str) -> usize {
             self.seen.iter().filter(|l| l.starts_with(prefix)).count()
         }
@@ -654,7 +704,12 @@ mod tests {
         assert_eq!(c.count(">STATE:"), 0, "no connection was started");
         // The second `log on all` printed the log again, with the command
         // lines in it that the old state reader took for states.
-        assert!(c.count("1700000000,D,MANAGEMENT: CMD 'log on all'") >= 2);
+        let dumped = c
+            .seen
+            .iter()
+            .filter(|l| !l.starts_with('>') && l.ends_with(",D,MANAGEMENT: CMD 'log on all'"))
+            .count();
+        assert!(dumped >= 2, "{:#?}", c.seen);
         assert_eq!(c.count("SUCCESS: real-time state notification"), 0);
     }
 
@@ -675,7 +730,7 @@ mod tests {
         c.send(USERNAME_CMD);
         c.until(USERNAME_OK);
         c.send("password \"Auth\" \"pw123456\"");
-        c.until(">STATE:1700000005,CONNECTED");
+        c.until_has(",CONNECTED,SUCCESS,");
         assert_eq!(
             fake.received(),
             vec![
@@ -705,8 +760,24 @@ mod tests {
         c.until(">PASSWORD:Need 'Auth'");
         c.send(USERNAME_CMD);
         c.send("password \"Auth\" \"pw123456\"");
-        c.until(">STATE:1700000005,CONNECTED");
+        c.until_has(",CONNECTED,SUCCESS,");
         assert_eq!(fake.received().len(), 6);
+    }
+
+    #[test]
+    fn log_lines_get_the_time_of_now() {
+        let now = unix_now().to_string();
+        assert_eq!(
+            stamp_now(">LOG:1700000002,N,Connection reset, restarting [0]"),
+            format!(">LOG:{now},N,Connection reset, restarting [0]")
+        );
+        assert_eq!(
+            stamp_now("1700000000,W,WARNING: a, b"),
+            format!("{now},W,WARNING: a, b")
+        );
+        for other in ["SUCCESS: hold release succeeded", ">HOLD:Waiting:5", "END"] {
+            assert_eq!(stamp_now(other), other);
+        }
     }
 
     #[test]

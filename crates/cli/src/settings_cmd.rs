@@ -655,11 +655,18 @@ mod tests {
         ] {
             std::fs::write(d.join(f), "client\nremote x.example.org 1194\n").unwrap();
         }
-        let names: Vec<String> = find_profiles(d)
+        let found: Vec<PathBuf> = find_profiles(d)
             .iter()
-            .map(|p| p.strip_prefix(d).unwrap().display().to_string())
+            .map(|p| p.strip_prefix(d).unwrap().to_path_buf())
             .collect();
-        assert_eq!(names, vec!["a.OVPN", "b.ovpn", "sub/c.ovpn"]);
+        assert_eq!(
+            found,
+            vec![
+                PathBuf::from("a.OVPN"),
+                PathBuf::from("b.ovpn"),
+                Path::new("sub").join("c.ovpn")
+            ]
+        );
         assert!(find_profiles(&d.join("nowhere")).is_empty());
         assert_eq!(
             servers_in(&d.join("b.ovpn")),
