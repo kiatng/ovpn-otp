@@ -510,6 +510,24 @@ fn process_exit_without_auto_reconnect_ends_the_session() {
 }
 
 #[test]
+fn link_drop_without_auto_reconnect_ends_as_dropped() {
+    let fake = Fake::new("pw123456");
+    let mut opts = options(Some("123456"), "pw");
+    opts.keepalive.auto_reconnect = false;
+    let h = session::start(opts, Box::new(fake.clone()));
+    let mut seen = Vec::new();
+    wait_for(&h, &mut seen, "CONNECTED", is_connected);
+    fake.drop_link();
+    let end = wait_for(&h, &mut seen, "end", is_ended);
+    assert!(matches!(
+        end,
+        Event::Ended {
+            reason: EndReason::Dropped(_)
+        }
+    ));
+}
+
+#[test]
 fn static_challenge_profiles_get_scrv1_password() {
     let mut fake = Fake::new("");
     fake.static_challenge = true;

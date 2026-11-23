@@ -46,6 +46,7 @@ pub fn prepare(
         return Err(ConnectError::NoLogin(loaded.settings.name.clone()));
     }
     let settings = &loaded.settings;
+    let launcher = OpenVpnLauncher::from_settings(settings)?;
     let (text, work_dir) = loaded.profile_text()?;
     let prepared = profile::prepare(&text, settings);
     let config_path = session::prepared_config_path(&runtime.path, &settings.name);
@@ -55,7 +56,6 @@ pub fn prepare(
             source: e,
         }
     })?;
-    let launcher = OpenVpnLauncher::from_settings(settings)?;
     let options = SessionOptions {
         login,
         code,

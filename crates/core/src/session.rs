@@ -293,6 +293,7 @@ struct Engine {
     next_reach_at: Option<Instant>,
     reach_running: bool,
     stopping: bool,
+    drop_reason: Option<String>,
     stop_deadline: Option<Instant>,
     fatal: Option<String>,
     last_reconnect_reason: String,
@@ -332,6 +333,7 @@ impl Engine {
             next_reach_at: None,
             reach_running: false,
             stopping: false,
+            drop_reason: None,
             stop_deadline: None,
             fatal: None,
             last_reconnect_reason: String::new(),
@@ -404,6 +406,7 @@ impl Engine {
         self.connected = false;
         self.next_reach_at = None;
         self.stopping = false;
+        self.drop_reason = None;
         self.stop_deadline = None;
         self.fatal = None;
         self.awaiting_login = None;
@@ -489,6 +492,7 @@ impl Engine {
                 Some(Input::Cmd(Command::Disconnect)) => {
                     if self.stopping {
                         process.kill();
+                        self.drop_reason = None;
                         return ProcessEnd::UserStop;
                     }
                     self.note(LogLevel::Info, "Disconnecting.");
@@ -510,9 +514,16 @@ impl Engine {
                         "OpenVPN did not stop in time; ending it.",
                     );
                     process.kill();
-                    return ProcessEnd::UserStop;
+                    return self.stop_end();
                 }
             }
+        }
+    }
+
+    fn stop_end(&mut self) -> ProcessEnd {
+        match self.drop_reason.take() {
+            Some(reason) => ProcessEnd::Dropped(reason),
+            None => ProcessEnd::UserStop,
         }
     }
 
@@ -565,7 +576,7 @@ impl Engine {
             process.kill();
         }
         if self.stopping {
-            return ProcessEnd::UserStop;
+            return self.stop_end();
         }
         if let Some(f) = self.fatal.take() {
             // A fatal error before ever connecting is a setup problem; retrying
@@ -767,6 +778,7 @@ impl Engine {
                             format!("Connection dropped ({reason}); auto-reconnect is off."),
                         );
                         self.stopping = true;
+                        self.drop_reason = Some(reason);
                         self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
                         self.send("signal SIGTERM", Reply::Simple);
                     }
