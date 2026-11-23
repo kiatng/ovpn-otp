@@ -772,6 +772,38 @@ fn a_try_without_progress_ends_with_a_timeout() {
     assert_eq!(snap.headline(chrono::Local::now()).title, "Failed");
 }
 
+/// A server that goes quiet in the given step ends the try with a timeout
+/// that names the step.
+fn assert_stall_times_out(outcome: Outcome, step: &str) {
+    let fake = Fake::new("pw123456").with_plan(&[outcome]);
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert!(started.elapsed() < Duration::from_secs(8), "took too long");
+    assert_eq!(failure.kind, FailureKind::Timeout);
+    assert!(
+        failure.message.contains(step),
+        "`{step}` is not in: {}",
+        failure.message
+    );
+}
+
+#[test]
+fn a_server_that_hangs_during_login_ends_with_a_timeout() {
+    assert_stall_times_out(Outcome::HangInAuth, "the server did not finish the login");
+}
+
+#[test]
+fn a_server_that_hangs_during_the_config_push_ends_with_a_timeout() {
+    assert_stall_times_out(
+        Outcome::HangInConfig,
+        "the server did not send its settings",
+    );
+}
+
 /// Waiting for the user to type a code is not a stuck try.
 #[test]
 fn waiting_for_a_code_is_not_a_timeout() {

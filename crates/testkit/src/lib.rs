@@ -33,6 +33,10 @@ pub enum Outcome {
     NoSharedCipher,
     /// Nothing happens: OpenVPN keeps waiting for the server.
     Hang,
+    /// The server is reached, then goes quiet during the login.
+    HangInAuth,
+    /// The login is accepted, then the server never sends its settings.
+    HangInConfig,
 }
 
 #[derive(Clone, Default)]
@@ -108,6 +112,8 @@ impl Fake {
                             "unreachable" => Ok(Outcome::Unreachable),
                             "no-shared-cipher" => Ok(Outcome::NoSharedCipher),
                             "hang" => Ok(Outcome::Hang),
+                            "hang-in-auth" => Ok(Outcome::HangInAuth),
+                            "hang-in-config" => Ok(Outcome::HangInConfig),
                             other => Err(format!("unknown outcome `{other}`")),
                         })
                         .collect();
@@ -468,6 +474,8 @@ impl Conn<'_> {
         self.emit(">LOG:1700000002,I,VERIFY OK: depth=0, CN=fake-server");
         match outcome {
             Outcome::Unreachable | Outcome::Hang => unreachable!("handled above"),
+            Outcome::HangInAuth => {}
+            Outcome::HangInConfig => self.emit_state("GET_CONFIG", ",,,,,"),
             Outcome::Reset => {
                 self.emit(">LOG:1700000002,N,Connection reset, restarting [0]");
                 self.emit(
