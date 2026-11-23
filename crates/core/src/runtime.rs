@@ -184,7 +184,11 @@ pub fn log_line(ev: &Event) -> Option<String> {
     let stamp = |t: &DateTime<Local>| t.format("%Y-%m-%d %H:%M:%S").to_string();
     Some(match ev {
         Event::Launching { at, attempt } => {
-            format!("{} app     info    starting OpenVPN (try {})", stamp(at), attempt + 1)
+            format!(
+                "{} app     info    starting OpenVPN (try {})",
+                stamp(at),
+                attempt + 1
+            )
         }
         Event::Wire { at, dir, text } => {
             let arrow = match dir {
@@ -208,7 +212,12 @@ pub fn log_line(ev: &Event) -> Option<String> {
             let at = chrono::TimeZone::timestamp_opt(&Local, e.time, 0)
                 .single()
                 .unwrap_or_else(Local::now);
-            format!("{} openvpn {:<7} {}", stamp(&at), e.level.label(), e.message)
+            format!(
+                "{} openvpn {:<7} {}",
+                stamp(&at),
+                e.level.label(),
+                e.message
+            )
         }
         Event::Note { at, level, text } => {
             format!("{} app     {:<7} {text}", stamp(at), level.label())
@@ -233,7 +242,11 @@ pub fn log_line(ev: &Event) -> Option<String> {
             delay.as_secs()
         ),
         Event::Reach(r) => match (r.ok, r.latency_ms) {
-            (true, Some(ms)) => format!("{} check   info    {} reachable in {ms:.1} ms", stamp(&r.at), r.target),
+            (true, Some(ms)) => format!(
+                "{} check   info    {} reachable in {ms:.1} ms",
+                stamp(&r.at),
+                r.target
+            ),
             _ => format!(
                 "{} check   warning {} not reachable: {}",
                 stamp(&r.at),
@@ -247,7 +260,10 @@ pub fn log_line(ev: &Event) -> Option<String> {
                 EndReason::Dropped(r) => format!("dropped: {r}"),
                 EndReason::Failed(r) => format!("failed: {r}"),
             };
-            format!("{} app     info    session ended, {text}", stamp(&Local::now()))
+            format!(
+                "{} app     info    session ended, {text}",
+                stamp(&Local::now())
+            )
         }
     })
 }

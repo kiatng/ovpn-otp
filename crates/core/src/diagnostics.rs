@@ -70,16 +70,24 @@ pub fn bundle(snap: &Snapshot, settings: &Settings, settings_path: &str, usernam
     }
     line(String::new());
 
-    line(format!("== settings ({settings_path}) ==", ));
+    line(format!("== settings ({settings_path}) ==",));
     let mut shown = settings.clone();
     if !shown.profile.inline.is_empty() {
-        shown.profile.inline = format!("<{} bytes of inline profile, not shown>", shown.profile.inline.len());
+        shown.profile.inline = format!(
+            "<{} bytes of inline profile, not shown>",
+            shown.profile.inline.len()
+        );
     }
     line(shown.to_toml());
 
     line("== timeline ==".into());
     for t in &snap.timeline {
-        line(format!("{} {:<13} {}", t.at.format("%H:%M:%S"), t.state, t.detail));
+        line(format!(
+            "{} {:<13} {}",
+            t.at.format("%H:%M:%S"),
+            t.state,
+            t.detail
+        ));
     }
     line(String::new());
 

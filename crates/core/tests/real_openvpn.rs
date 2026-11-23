@@ -130,18 +130,32 @@ command_prefix = []
     // 1. Connect.
     w.until("first CONNECTED", connected);
     assert_eq!(w.snap.phase, Phase::Connected);
-    assert!(w.snap.local_ip.starts_with("10.89.0."), "ip {}", w.snap.local_ip);
+    assert!(
+        w.snap.local_ip.starts_with("10.89.0."),
+        "ip {}",
+        w.snap.local_ip
+    );
     assert_eq!(w.snap.server, "127.0.0.1:11940");
-    assert!(w.snap.routes.contains(&"10.90.0.0/24".to_string()), "routes {:?}", w.snap.routes);
+    assert!(
+        w.snap.routes.contains(&"10.90.0.0/24".to_string()),
+        "routes {:?}",
+        w.snap.routes
+    );
     assert!(w.snap.dns.contains(&"10.89.0.53".to_string()));
     assert!(w.snap.openvpn_version.starts_with("OpenVPN 2."));
     // GET_CONFIG is not reported by every OpenVPN version.
     for s in ["WAIT", "AUTH", "ASSIGN_IP", "ADD_ROUTES", "CONNECTED"] {
-        assert!(w.snap.timeline.iter().any(|t| t.state == s), "timeline misses {s}");
+        assert!(
+            w.snap.timeline.iter().any(|t| t.state == s),
+            "timeline misses {s}"
+        );
     }
 
     // 2. Byte counts arrive and grow.
-    w.until("bytes", |e, _| matches!(e, Event::Bytes { bytes_in, .. } if *bytes_in > 0));
+    w.until(
+        "bytes",
+        |e, _| matches!(e, Event::Bytes { bytes_in, .. } if *bytes_in > 0),
+    );
     // 3. The reachability check works through the tunnel address.
     let ev = w.until("reach", |e, _| matches!(e, Event::Reach(_)));
     let Event::Reach(r) = ev else { unreachable!() };
@@ -149,15 +163,35 @@ command_prefix = []
 
     // 4. The server drops us: the session reconnects and wants a fresh code.
     kick_client(&server_mgmt);
-    w.until("reconnecting", |e, _| matches!(e, Event::Reconnecting { .. }));
+    w.until("reconnecting", |e, _| {
+        matches!(e, Event::Reconnecting { .. })
+    });
     let ev = w.until("need code", |e, _| matches!(e, Event::NeedCode { .. }));
-    assert!(matches!(ev, Event::NeedCode { reason: CodeReason::Reconnect }), "{ev:?}");
+    assert!(
+        matches!(
+            ev,
+            Event::NeedCode {
+                reason: CodeReason::Reconnect
+            }
+        ),
+        "{ev:?}"
+    );
 
     // 5. A wrong code is rejected and the session asks again.
     h.send_code("000000");
     w.until("auth failed", |e, _| matches!(e, Event::AuthFailed { .. }));
-    let ev = w.until("need code again", |e, _| matches!(e, Event::NeedCode { .. }));
-    assert!(matches!(ev, Event::NeedCode { reason: CodeReason::Rejected }), "{ev:?}");
+    let ev = w.until("need code again", |e, _| {
+        matches!(e, Event::NeedCode { .. })
+    });
+    assert!(
+        matches!(
+            ev,
+            Event::NeedCode {
+                reason: CodeReason::Rejected
+            }
+        ),
+        "{ev:?}"
+    );
 
     // 6. The right code reconnects.
     h.send_code(CODE);
@@ -167,7 +201,15 @@ command_prefix = []
     // 7. Disconnect.
     h.disconnect();
     let end = w.until("end", |e, _| matches!(e, Event::Ended { .. }));
-    assert!(matches!(end, Event::Ended { reason: EndReason::Disconnected }), "{end:?}");
+    assert!(
+        matches!(
+            end,
+            Event::Ended {
+                reason: EndReason::Disconnected
+            }
+        ),
+        "{end:?}"
+    );
     let seen = std::mem::take(&mut w.seen);
     drop(w);
     h.join();

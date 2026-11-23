@@ -497,12 +497,10 @@ mod tests {
         );
         assert_eq!(
             parse_line(">PASSWORD:Verification Failed: 'Auth'"),
-            Line::Notification(Notification::Password(
-                PasswordNotice::VerificationFailed {
-                    realm: "Auth".into(),
-                    reason: String::new()
-                }
-            ))
+            Line::Notification(Notification::Password(PasswordNotice::VerificationFailed {
+                realm: "Auth".into(),
+                reason: String::new()
+            }))
         );
         assert_eq!(
             parse_line(">PASSWORD:Auth-Token:c2VjcmV0"),

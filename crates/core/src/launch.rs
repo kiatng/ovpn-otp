@@ -183,12 +183,16 @@ pub fn find_openvpn(configured: &str) -> Result<PathBuf, LaunchError> {
     if let Some(found) = search_path(name) {
         return Ok(found);
     }
-    candidates
-        .into_iter()
-        .find(|p| p.is_file())
-        .ok_or_else(|| {
-            LaunchError::NotFound(if cfg!(windows) { WINDOWS_HELP } else { LINUX_HELP }.into())
-        })
+    candidates.into_iter().find(|p| p.is_file()).ok_or_else(|| {
+        LaunchError::NotFound(
+            if cfg!(windows) {
+                WINDOWS_HELP
+            } else {
+                LINUX_HELP
+            }
+            .into(),
+        )
+    })
 }
 
 fn search_path(name: &str) -> Option<PathBuf> {
@@ -269,7 +273,7 @@ fn launch_direct(
     let port = free_port().map_err(|e| LaunchError::Spawn(e.to_string()))?;
     let password = random_password();
     // OpenVPN reads the management password from a file. It lives in the
-    // private folder and is deleted as soon as the session has logged in.
+    // private folder and is deleted when this OpenVPN process handle is dropped.
     let pw_file = req.private_dir.join(format!("mgmt-{port}.pw"));
     write_private(&pw_file, format!("{}\n", password.expose()).as_bytes())
         .map_err(|e| LaunchError::Spawn(format!("cannot write {}: {e}", pw_file.display())))?;
@@ -277,7 +281,11 @@ fn launch_direct(
     let mut args: Vec<String> = Vec::new();
     args.push("--config".into());
     args.push(req.config.display().to_string());
-    args.extend(management_args(port, &pw_file.display().to_string(), req.verb));
+    args.extend(management_args(
+        port,
+        &pw_file.display().to_string(),
+        req.verb,
+    ));
 
     let (exe, all_args): (String, Vec<String>) = match prefix.split_first() {
         Some((first, rest)) => {
@@ -423,17 +431,16 @@ mod windows {
 
     pub fn service_available() -> bool {
         // Opening and closing the pipe without writing does not start anything.
-        OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(PIPE)
-            .is_ok()
+        OpenOptions::new().read(true).write(true).open(PIPE).is_ok()
     }
 
     pub fn launch_service(req: &LaunchRequest) -> Result<Launched, LaunchError> {
         let port = free_port().map_err(|e| LaunchError::Spawn(e.to_string()))?;
         let password = random_password();
-        let mut args = vec!["--config".to_string(), quote_arg(&req.config.display().to_string())];
+        let mut args = vec![
+            "--config".to_string(),
+            quote_arg(&req.config.display().to_string()),
+        ];
         args.extend(management_args(port, "stdin", req.verb));
         let options = args.join(" ");
 
@@ -461,7 +468,10 @@ mod windows {
         let code = lines.next().unwrap_or("").trim();
         if code != "0x00000000" {
             let rest: Vec<&str> = lines.collect();
-            return Err(LaunchError::Service(explain_service_error(code, &rest.join(" "))));
+            return Err(LaunchError::Service(explain_service_error(
+                code,
+                &rest.join(" "),
+            )));
         }
         Ok(Launched {
             process: Box::new(ServiceProcess {

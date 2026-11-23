@@ -172,7 +172,9 @@ fn prompt_line(prompt: &str) -> Result<String> {
 /// Ask for the code with visible input until it looks right.
 fn prompt_code(digits: u8) -> Result<String> {
     loop {
-        let code = prompt_line(&format!("Authenticator code ({digits} digits, shown as you type): "))?;
+        let code = prompt_line(&format!(
+            "Authenticator code ({digits} digits, shown as you type): "
+        ))?;
         match validate_code(&code, digits) {
             Ok(c) => return Ok(c),
             Err(e) => eprintln!("{e}"),
@@ -235,13 +237,7 @@ fn cmd_login(path: &Path, username: Option<String>) -> Result<ExitCode> {
         bail!("the user name is empty");
     }
     let password = Secret::new(rpassword::prompt_password("Password (hidden): ")?);
-    KeyringStore.save(
-        &loaded.settings.name,
-        &Login {
-            username,
-            password,
-        },
-    )?;
+    KeyringStore.save(&loaded.settings.name, &Login { username, password })?;
     println!(
         "Saved the login for '{}' in the OS credential store.",
         loaded.settings.name
@@ -417,7 +413,9 @@ fn print_event(ev: &Event, snap: &Snapshot, digits: u8, verbose: bool) {
         Event::Reach(r) => {
             if verbose || !r.ok {
                 match (r.ok, r.latency_ms) {
-                    (true, Some(ms)) => eprintln!("{}  {} reachable, {ms:.1} ms", hms(&r.at), r.target),
+                    (true, Some(ms)) => {
+                        eprintln!("{}  {} reachable, {ms:.1} ms", hms(&r.at), r.target)
+                    }
                     _ => eprintln!(
                         "{}  {} not reachable: {}",
                         hms(&r.at),
@@ -489,7 +487,10 @@ fn print_status(st: &StatusFile) {
     println!("Server:     {}", or_dash(&s.server));
     println!("Address:    {}", or_dash(&s.local_ip));
     if let Some(since) = s.connected_since {
-        println!("Up for:     {}", format_duration((now - since).num_seconds()));
+        println!(
+            "Up for:     {}",
+            format_duration((now - since).num_seconds())
+        );
     }
     println!(
         "Received:   {} ({}/s)",
@@ -613,7 +614,10 @@ fn cmd_config(path: &Path, action: ConfigCmd) -> Result<ExitCode> {
             force,
         } => {
             if path.exists() && !force {
-                bail!("{} already exists (use --force to replace it)", path.display());
+                bail!(
+                    "{} already exists (use --force to replace it)",
+                    path.display()
+                );
             }
             let profile = std::fs::canonicalize(&profile)
                 .with_context(|| format!("cannot find the profile {}", profile.display()))?;
@@ -648,7 +652,12 @@ fn cmd_diagnostics(path: &Path) -> Result<ExitCode> {
         .flatten()
         .map(|l| l.username)
         .unwrap_or_default();
-    let mut text = diagnostics::bundle(&snap, &loaded.settings, &path.display().to_string(), &username);
+    let mut text = diagnostics::bundle(
+        &snap,
+        &loaded.settings,
+        &path.display().to_string(),
+        &username,
+    );
     if let Ok(log) = std::fs::read_to_string(rt.log_path()) {
         let lines: Vec<&str> = log.lines().collect();
         let skip = lines.len().saturating_sub(400);
@@ -694,20 +703,33 @@ fn cmd_doctor(path: &Path) -> Result<ExitCode> {
     }
     match OpenVpnLauncher::from_settings(&loaded.settings) {
         Ok(l) => match &l.mode {
-            launch::LaunchMode::Service => check(true, "openvpn", "OpenVPN interactive service is running".into()),
+            launch::LaunchMode::Service => check(
+                true,
+                "openvpn",
+                "OpenVPN interactive service is running".into(),
+            ),
             launch::LaunchMode::Direct { program, prefix } => {
                 let version = std::process::Command::new(program)
                     .arg("--version")
                     .output()
                     .ok()
-                    .and_then(|o| String::from_utf8_lossy(&o.stdout).lines().next().map(str::to_string))
+                    .and_then(|o| {
+                        String::from_utf8_lossy(&o.stdout)
+                            .lines()
+                            .next()
+                            .map(str::to_string)
+                    })
                     .unwrap_or_else(|| "version unknown".into());
                 let how = if prefix.is_empty() {
                     String::new()
                 } else {
                     format!(", run with `{}`", prefix.join(" "))
                 };
-                check(true, "openvpn", format!("{} ({version}{how})", program.display()));
+                check(
+                    true,
+                    "openvpn",
+                    format!("{} ({version}{how})", program.display()),
+                );
                 if prefix.first().map(String::as_str) == Some("sudo") {
                     let sudo_ok = std::process::Command::new("sudo")
                         .args(["-n", "-l", &program.display().to_string()])
@@ -730,8 +752,16 @@ fn cmd_doctor(path: &Path) -> Result<ExitCode> {
     }
     match KeyringStore.load(&loaded.settings.name) {
         Ok(Some(l)) => check(true, "saved login", format!("user name '{}'", l.username)),
-        Ok(None) => check(false, "saved login", "none yet; run `ovpn-otp login`".into()),
+        Ok(None) => check(
+            false,
+            "saved login",
+            "none yet; run `ovpn-otp login`".into(),
+        ),
         Err(e) => check(false, "saved login", e.to_string()),
     }
-    Ok(if ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
+    Ok(if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }

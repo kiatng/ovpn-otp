@@ -134,7 +134,15 @@ impl Snapshot {
                 if *attempt == 0 {
                     self.last_error = None;
                 }
-                self.push_timeline(*at, "START", if *attempt == 0 { "starting OpenVPN".into() } else { format!("retry {attempt}") });
+                self.push_timeline(
+                    *at,
+                    "START",
+                    if *attempt == 0 {
+                        "starting OpenVPN".into()
+                    } else {
+                        format!("retry {attempt}")
+                    },
+                );
             }
             Event::Wire { at, dir, text } => push_capped(
                 &mut self.wire,
@@ -236,7 +244,9 @@ impl Snapshot {
                 let text = match reason {
                     CodeReason::Initial => "Waiting for the authenticator code.",
                     CodeReason::Reconnect => "Reconnecting: enter a new authenticator code.",
-                    CodeReason::Rejected => "Login rejected: check the password and enter a new code.",
+                    CodeReason::Rejected => {
+                        "Login rejected: check the password and enter a new code."
+                    }
                     CodeReason::Expired => "The code was too old: enter a new one.",
                 };
                 self.push_app_log(Local::now(), LogLevel::Warning, text.into());
@@ -251,7 +261,11 @@ impl Snapshot {
             Event::AuthFailed { reason } => {
                 self.last_error = Some(format!("Login rejected: {reason}"));
                 self.push_timeline(Local::now(), "AUTH_FAILED", reason.clone());
-                self.push_app_log(Local::now(), LogLevel::Error, format!("Login rejected: {reason}"));
+                self.push_app_log(
+                    Local::now(),
+                    LogLevel::Error,
+                    format!("Login rejected: {reason}"),
+                );
             }
             Event::Pushed(p) => {
                 if !p.routes.is_empty() {
@@ -384,7 +398,11 @@ mod tests {
             info: StateInfo {
                 time: 0,
                 name: name.into(),
-                detail: if name == "CONNECTED" { "SUCCESS".into() } else { String::new() },
+                detail: if name == "CONNECTED" {
+                    "SUCCESS".into()
+                } else {
+                    String::new()
+                },
                 local_ip: ip.into(),
                 remote_ip: "198.51.100.7".into(),
                 remote_port: "8443".into(),

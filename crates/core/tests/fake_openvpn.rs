@@ -123,7 +123,10 @@ impl Launcher for Fake {
 /// Undo management quoting: `"a\"b"` -> `a"b`.
 fn unquote(s: &str) -> String {
     let s = s.trim();
-    let inner = s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).unwrap_or(s);
+    let inner = s
+        .strip_prefix('"')
+        .and_then(|s| s.strip_suffix('"'))
+        .unwrap_or(s);
     let mut out = String::new();
     let mut esc = false;
     for c in inner.chars() {
@@ -154,7 +157,10 @@ impl Fake {
             return;
         }
         out(&mut w, "SUCCESS: password is correct\n");
-        out(&mut w, ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n");
+        out(
+            &mut w,
+            ">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info\n",
+        );
         out(&mut w, ">HOLD:Waiting for hold release:0\n");
         let sc = self.static_challenge;
         let need = if sc {
@@ -171,26 +177,51 @@ impl Fake {
             let cmd = line.trim_end().to_string();
             self.shared.received.lock().unwrap().push(cmd.clone());
             if cmd == "log on all" {
-                out(&mut w, "1700000000,I,OpenVPN 2.6.12 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZ4]\n");
-                out(&mut w, "1700000000,W,WARNING: a history warning, with commas\n");
-                out(&mut w, "END\nSUCCESS: real-time log notification set to ON\n");
+                out(
+                    &mut w,
+                    "1700000000,I,OpenVPN 2.6.12 x86_64-pc-linux-gnu [SSL (OpenSSL)] [LZ4]\n",
+                );
+                out(
+                    &mut w,
+                    "1700000000,W,WARNING: a history warning, with commas\n",
+                );
+                out(
+                    &mut w,
+                    "END\nSUCCESS: real-time log notification set to ON\n",
+                );
             } else if cmd == "state on all" {
                 out(&mut w, "1700000000,CONNECTING,,,,,,\nEND\nSUCCESS: real-time state notification set to ON\n");
             } else if cmd == "bytecount 1" {
                 out(&mut w, "SUCCESS: bytecount interval changed\n");
             } else if cmd == "hold release" {
-                self.shared.hold_releases.lock().unwrap().push(Instant::now());
+                self.shared
+                    .hold_releases
+                    .lock()
+                    .unwrap()
+                    .push(Instant::now());
                 out(&mut w, "SUCCESS: hold release succeeded\n");
-                out(&mut w, ">STATE:1700000001,WAIT,,,,,,\n>STATE:1700000002,AUTH,,,,,,\n");
+                out(
+                    &mut w,
+                    ">STATE:1700000001,WAIT,,,,,,\n>STATE:1700000002,AUTH,,,,,,\n",
+                );
                 out(&mut w, need);
             } else if cmd.starts_with("username ") {
-                out(&mut w, "SUCCESS: 'Auth' username entered, but not yet verified\n");
+                out(
+                    &mut w,
+                    "SUCCESS: 'Auth' username entered, but not yet verified\n",
+                );
             } else if let Some(rest) = cmd.strip_prefix("password \"Auth\" ") {
-                out(&mut w, "SUCCESS: 'Auth' password entered, but not yet verified\n");
+                out(
+                    &mut w,
+                    "SUCCESS: 'Auth' password entered, but not yet verified\n",
+                );
                 if unquote(rest) == *self.accept.lock().unwrap() {
                     out(&mut w, ">LOG:1700000003,I,PUSH: Received control message: 'PUSH_REPLY,route 10.20.0.0 255.255.0.0,dhcp-option DNS 10.20.0.53,ifconfig 10.8.0.6 255.255.255.0'\n");
                     out(&mut w, ">STATE:1700000003,GET_CONFIG,,,,,,\n>STATE:1700000004,ASSIGN_IP,,10.8.0.6,,,,\n>STATE:1700000004,ADD_ROUTES,,,,,,\n");
-                    out(&mut w, ">STATE:1700000005,CONNECTED,SUCCESS,10.8.0.6,198.51.100.7,8443,,\n");
+                    out(
+                        &mut w,
+                        ">STATE:1700000005,CONNECTED,SUCCESS,10.8.0.6,198.51.100.7,8443,,\n",
+                    );
                     out(&mut w, ">BYTECOUNT:1000,500\n>BYTECOUNT:5000,900\n");
                 } else {
                     out(&mut w, ">PASSWORD:Verification Failed: 'Auth'\n");
@@ -198,7 +229,10 @@ impl Fake {
                     out(&mut w, ">HOLD:Waiting for hold release:5\n");
                 }
             } else if cmd == "signal SIGTERM" {
-                out(&mut w, "SUCCESS: signal SIGTERM thrown\n>STATE:1700000009,EXITING,SIGTERM,,,,,\n");
+                out(
+                    &mut w,
+                    "SUCCESS: signal SIGTERM thrown\n>STATE:1700000009,EXITING,SIGTERM,,,,,\n",
+                );
                 exited.store(true, Ordering::SeqCst);
                 let _ = w.shutdown(std::net::Shutdown::Both);
                 break;
@@ -253,7 +287,9 @@ fn wait_for(
             }
             Err(_) => panic!(
                 "timed out waiting for {what}; events so far:\n{:#?}",
-                seen.iter().filter(|e| !matches!(e, Event::Wire { .. })).collect::<Vec<_>>()
+                seen.iter()
+                    .filter(|e| !matches!(e, Event::Wire { .. }))
+                    .collect::<Vec<_>>()
             ),
         }
     }
@@ -287,7 +323,9 @@ fn connects_with_code_appended_to_password() {
     let h = session::start(options(Some("123456"), "pw"), Box::new(fake.clone()));
     let mut seen = Vec::new();
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
-    wait_for(&h, &mut seen, "bytes", |e| matches!(e, Event::Bytes { bytes_in: 5000, .. }));
+    wait_for(&h, &mut seen, "bytes", |e| {
+        matches!(e, Event::Bytes { bytes_in: 5000, .. })
+    });
 
     let got = fake.received();
     assert!(got.contains(&"log on all".to_string()));
@@ -295,20 +333,33 @@ fn connects_with_code_appended_to_password() {
     assert!(got.contains(&"bytecount 1".to_string()));
     assert!(got.contains(&"hold release".to_string()));
     assert!(got.contains(&"username \"Auth\" \"alice\"".to_string()));
-    assert_eq!(password_lines(&fake), vec!["password \"Auth\" \"pw123456\""]);
+    assert_eq!(
+        password_lines(&fake),
+        vec!["password \"Auth\" \"pw123456\""]
+    );
 
     // The transcript never shows the password or the combined string.
     for e in &seen {
         if let Event::Wire { text, .. } = e {
             assert!(!text.contains("pw123456"), "secret leaked: {text}");
-            assert!(!text.contains(MGMT_PW), "management password leaked: {text}");
+            assert!(
+                !text.contains(MGMT_PW),
+                "management password leaked: {text}"
+            );
         }
     }
-    assert!(seen.iter().any(|e| matches!(e, Event::Wire { dir: Direction::Out, text, .. } if text.contains("hidden"))));
+    assert!(seen.iter().any(
+        |e| matches!(e, Event::Wire { dir: Direction::Out, text, .. } if text.contains("hidden"))
+    ));
 
     h.disconnect();
     let end = wait_for(&h, &mut seen, "end", is_ended);
-    assert!(matches!(end, Event::Ended { reason: EndReason::Disconnected }));
+    assert!(matches!(
+        end,
+        Event::Ended {
+            reason: EndReason::Disconnected
+        }
+    ));
     assert!(fake.received().contains(&"signal SIGTERM".to_string()));
 
     // Fold everything into a snapshot, as the GUI and CLI do.
@@ -324,10 +375,22 @@ fn connects_with_code_appended_to_password() {
     assert_eq!(snap.bytes_in, 5000);
     assert!(snap.openvpn_version.starts_with("OpenVPN 2.6.12"));
     let states: Vec<&str> = snap.timeline.iter().map(|t| t.state.as_str()).collect();
-    for s in ["CONNECTING", "WAIT", "AUTH", "GET_CONFIG", "ASSIGN_IP", "ADD_ROUTES", "CONNECTED", "EXITING"] {
+    for s in [
+        "CONNECTING",
+        "WAIT",
+        "AUTH",
+        "GET_CONFIG",
+        "ASSIGN_IP",
+        "ADD_ROUTES",
+        "CONNECTED",
+        "EXITING",
+    ] {
         assert!(states.contains(&s), "timeline misses {s}: {states:?}");
     }
-    assert!(snap.logs.iter().any(|l| l.message.contains("history warning, with commas")));
+    assert!(snap
+        .logs
+        .iter()
+        .any(|l| l.message.contains("history warning, with commas")));
 }
 
 #[test]
@@ -340,7 +403,10 @@ fn asks_for_code_when_none_given() {
     assert!(password_lines(&fake).is_empty());
     h.send_code("654 321");
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
-    assert_eq!(password_lines(&fake), vec!["password \"Auth\" \"pw654321\""]);
+    assert_eq!(
+        password_lines(&fake),
+        vec!["password \"Auth\" \"pw654321\""]
+    );
     h.disconnect();
     wait_for(&h, &mut seen, "end", is_ended);
 }
@@ -350,14 +416,19 @@ fn rejected_login_asks_for_a_new_code() {
     let fake = Fake::new("pw111111");
     let h = session::start(options(Some("999999"), "pw"), Box::new(fake.clone()));
     let mut seen = Vec::new();
-    wait_for(&h, &mut seen, "auth failed", |e| matches!(e, Event::AuthFailed { .. }));
+    wait_for(&h, &mut seen, "auth failed", |e| {
+        matches!(e, Event::AuthFailed { .. })
+    });
     let ev = wait_for(&h, &mut seen, "need code", |e| need_code(e).is_some());
     assert_eq!(need_code(&ev), Some(CodeReason::Rejected));
     h.send_code("111111");
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
     assert_eq!(
         password_lines(&fake),
-        vec!["password \"Auth\" \"pw999999\"", "password \"Auth\" \"pw111111\""]
+        vec![
+            "password \"Auth\" \"pw999999\"",
+            "password \"Auth\" \"pw111111\""
+        ]
     );
     h.disconnect();
     wait_for(&h, &mut seen, "end", is_ended);
@@ -372,8 +443,15 @@ fn link_drop_waits_backoff_and_asks_for_fresh_code() {
 
     let dropped_at = Instant::now();
     fake.drop_link();
-    let ev = wait_for(&h, &mut seen, "reconnecting", |e| matches!(e, Event::Reconnecting { .. }));
-    let Event::Reconnecting { attempt, reason, .. } = ev else { unreachable!() };
+    let ev = wait_for(&h, &mut seen, "reconnecting", |e| {
+        matches!(e, Event::Reconnecting { .. })
+    });
+    let Event::Reconnecting {
+        attempt, reason, ..
+    } = ev
+    else {
+        unreachable!()
+    };
     assert_eq!(attempt, 1);
     assert_eq!(reason, "ping-restart");
 
@@ -402,7 +480,9 @@ fn process_exit_after_connect_relaunches_openvpn() {
     let mut seen = Vec::new();
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
     fake.crash();
-    wait_for(&h, &mut seen, "reconnecting", |e| matches!(e, Event::Reconnecting { .. }));
+    wait_for(&h, &mut seen, "reconnecting", |e| {
+        matches!(e, Event::Reconnecting { .. })
+    });
     // A code typed during the backoff is used for the next login.
     h.send_code("123456");
     wait_for(&h, &mut seen, "CONNECTED again", is_connected);
@@ -421,15 +501,19 @@ fn process_exit_without_auto_reconnect_ends_the_session() {
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
     fake.crash();
     let end = wait_for(&h, &mut seen, "end", is_ended);
-    assert!(matches!(end, Event::Ended { reason: EndReason::Dropped(_) }));
+    assert!(matches!(
+        end,
+        Event::Ended {
+            reason: EndReason::Dropped(_)
+        }
+    ));
 }
 
 #[test]
 fn static_challenge_profiles_get_scrv1_password() {
     let mut fake = Fake::new("");
     fake.static_challenge = true;
-    *fake.accept.lock().unwrap() =
-        ovpn_otp_core::mgmt::static_challenge_response("pw", "123456");
+    *fake.accept.lock().unwrap() = ovpn_otp_core::mgmt::static_challenge_response("pw", "123456");
     let h = session::start(options(Some("123456"), "pw"), Box::new(fake.clone()));
     let mut seen = Vec::new();
     wait_for(&h, &mut seen, "CONNECTED", is_connected);
@@ -462,7 +546,9 @@ fn launch_failure_ends_with_failed() {
     let h = session::start(options(Some("123456"), "pw"), Box::new(fake));
     let mut seen = Vec::new();
     let end = wait_for(&h, &mut seen, "end", is_ended);
-    assert!(matches!(end, Event::Ended { reason: EndReason::Failed(m) } if m.contains("no openvpn here")));
+    assert!(
+        matches!(end, Event::Ended { reason: EndReason::Failed(m) } if m.contains("no openvpn here"))
+    );
 }
 
 #[test]
@@ -472,7 +558,12 @@ fn bad_codes_are_refused_before_sending() {
     let mut seen = Vec::new();
     wait_for(&h, &mut seen, "need code", |e| need_code(e).is_some());
     h.send_code("12ab");
-    wait_for(&h, &mut seen, "warning", |e| matches!(e, Event::Note { text, .. } if text.contains("digits")));
+    wait_for(
+        &h,
+        &mut seen,
+        "warning",
+        |e| matches!(e, Event::Note { text, .. } if text.contains("digits")),
+    );
     assert!(password_lines(&fake).is_empty());
     h.send_code("123456");
     wait_for(&h, &mut seen, "CONNECTED", is_connected);

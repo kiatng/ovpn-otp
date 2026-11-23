@@ -495,7 +495,10 @@ impl Engine {
             self.on_timers(process.as_mut());
             if let Some(d) = self.stop_deadline {
                 if Instant::now() >= d {
-                    self.note(LogLevel::Warning, "OpenVPN did not stop in time; ending it.");
+                    self.note(
+                        LogLevel::Warning,
+                        "OpenVPN did not stop in time; ending it.",
+                    );
                     process.kill();
                     return ProcessEnd::UserStop;
                 }
@@ -635,7 +638,9 @@ impl Engine {
                 }
                 if let Some(front) = self.pending.front_mut() {
                     front.got_reply = true;
-                    if front.kind == Reply::Simple || front.got_end || matches!(line, Line::Error(_))
+                    if front.kind == Reply::Simple
+                        || front.got_end
+                        || matches!(line, Line::Error(_))
                     {
                         self.pending.pop_front();
                     }
@@ -935,7 +940,9 @@ fn exit_message(code: Option<i32>, tail: &[String]) -> String {
              or set [openvpn.linux] command_prefix = [\"pkexec\"] for a password dialog.",
         );
     } else if joined.contains("Cannot open TUN") || joined.contains("Operation not permitted") {
-        msg.push_str("\nOpenVPN has no right to create the tunnel. See the README section on privileges.");
+        msg.push_str(
+            "\nOpenVPN has no right to create the tunnel. See the README section on privileges.",
+        );
     }
     msg.push_str(&tail_text(tail));
     msg
@@ -945,7 +952,13 @@ fn exit_message(code: Option<i32>, tail: &[String]) -> String {
 pub fn prepared_config_path(dir: &std::path::Path, name: &str) -> PathBuf {
     let safe: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect();
     dir.join(format!("{safe}.ovpn"))
 }

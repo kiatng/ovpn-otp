@@ -191,7 +191,9 @@ remote inside-a-block-is-not-an-option
         let p = prepare(PROFILE, &Settings::default());
         assert!(p.text.contains("\nauth-user-pass\n"));
         assert!(!p.text.contains("auth-user-pass creds.txt\n"));
-        assert!(p.text.contains("# removed by ovpn-otp: management 127.0.0.1 7505"));
+        assert!(p
+            .text
+            .contains("# removed by ovpn-otp: management 127.0.0.1 7505"));
         assert!(p.text.contains("auth-nocache\nping 10\nping-restart 60\n"));
         assert!(p.text.contains("remote inside-a-block-is-not-an-option"));
         assert_eq!(p.remotes, vec!["203.0.113.10:8443"]);

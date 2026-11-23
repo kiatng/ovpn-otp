@@ -296,7 +296,11 @@ impl LoadedSettings {
         if inline.is_empty() {
             return Err(SettingsError::NoProfile(self.path.clone()));
         }
-        let dir = self.path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let dir = self
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
         Ok((inline.to_string(), dir))
     }
 }
@@ -315,13 +319,23 @@ mod tests {
 
     #[test]
     fn round_trips() {
-        let mut s = Settings::default();
-        s.name = "work".into();
+        let mut s = Settings {
+            name: "work".into(),
+            ..Settings::default()
+        };
         s.profile.path = "work.ovpn".into();
         s.check.host = "10.0.0.1:443".into();
         s.openvpn.linux.command_prefix = Some(vec![]);
         let back = Settings::from_toml(&s.to_toml()).unwrap();
         assert_eq!(back, s);
+    }
+
+    #[test]
+    fn example_file_parses() {
+        let s = Settings::from_toml(include_str!("../../../examples/settings.toml")).unwrap();
+        assert_eq!(s.name, "work");
+        assert_eq!(s.profile.path, "work.ovpn");
+        assert_eq!(s.keepalive, KeepAlive::default());
     }
 
     #[test]
@@ -333,7 +347,11 @@ mod tests {
     fn profile_path_is_relative_to_settings_file() {
         let dir = tempfile::tempdir().unwrap();
         let settings_file = dir.path().join("settings.toml");
-        std::fs::write(&settings_file, "name = \"w\"\n[profile]\npath = \"w.ovpn\"\n").unwrap();
+        std::fs::write(
+            &settings_file,
+            "name = \"w\"\n[profile]\npath = \"w.ovpn\"\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("w.ovpn"), "client\n").unwrap();
         let loaded = load(&settings_file).unwrap();
         assert_eq!(loaded.profile_path().unwrap(), dir.path().join("w.ovpn"));
