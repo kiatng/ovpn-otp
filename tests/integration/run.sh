@@ -23,7 +23,9 @@ if [ "${1:-}" != "--inside" ]; then
   (cd "$ROOT" && cargo build -p ovpn-otp && cargo test -p ovpn-otp-core --test real_openvpn --no-run)
   rm -rf "$WORK"
   mkdir -p "$WORK"
-  exec unshare --user --map-root-user --net "$0" --inside
+  # --pid --fork --kill-child (with its own /proc): when this script ends, every process it started
+  # in the namespace ends too, even if a test failed half-way.
+  exec unshare --user --map-root-user --net --pid --fork --kill-child --mount --mount-proc "$0" --inside
 fi
 
 cd "$WORK"

@@ -181,10 +181,20 @@ impl SessionHandle {
         &self.events
     }
 
-    /// Wait for the session thread to finish.
+    /// Wait for the session thread to finish. Call it after [`Event::Ended`].
     pub fn join(mut self) {
         if let Some(t) = self.thread.take() {
             let _ = t.join();
+        }
+    }
+}
+
+impl Drop for SessionHandle {
+    /// Dropping the handle of a running session disconnects it, so OpenVPN is
+    /// not left running with nobody watching it.
+    fn drop(&mut self) {
+        if self.thread.is_some() {
+            let _ = self.tx.send(Input::Cmd(Command::Disconnect));
         }
     }
 }

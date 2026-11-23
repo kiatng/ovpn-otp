@@ -46,10 +46,21 @@ impl StatusFile {
     /// True when a session is still updating this file.
     pub fn is_live(&self) -> bool {
         self.running
+            && pid_alive(self.pid)
             && (Local::now() - self.updated)
                 .to_std()
                 .map(|d| d < STALE_AFTER)
                 .unwrap_or(true)
+    }
+}
+
+/// Whether a process with this id exists. Only checked on Linux; elsewhere
+/// the update time alone decides.
+fn pid_alive(pid: u32) -> bool {
+    if cfg!(target_os = "linux") {
+        Path::new("/proc").join(pid.to_string()).exists()
+    } else {
+        true
     }
 }
 

@@ -4,6 +4,8 @@ ovpn-otp connects you to an OpenVPN server that wants your 6-digit authenticator
 
 It works with Sophos Firewall SSL VPN and with any other OpenVPN server that expects the code appended to the password. It runs on Windows and Linux, as a small desktop window (`ovpn-otp-gui`) and as a command-line tool (`ovpn-otp`) for scripts and agents.
 
+![The ovpn-otp window, connected: login on the left, status, traffic and the connection timeline on the right](docs/window-connected.png)
+
 > [!NOTE]
 > ovpn-otp is an independent open-source project. It is not affiliated with, endorsed by or connected to Sophos or OpenVPN Inc. It uses the free OpenVPN community program to make the actual connection.
 
@@ -101,6 +103,8 @@ The right side shows what is going on:
 Two settings make OpenVPN notice a dead link: it sends a keep-alive **ping** every 10 seconds, and when nothing arrives for 60 seconds it **restarts** the connection. Some servers send their own values, which then take priority.
 
 When a connection drops, ovpn-otp waits a little and tries again: first 2 seconds, then 4, 8 and so on, up to 60 seconds. The server needs a fresh code for the new login, so the window comes to the front, the code box turns orange and says "Reconnecting: enter a new code". In the terminal, `connect` prints a prompt; type the code and press Enter. A code that is more than 90 seconds old is not used, because the server would reject it.
+
+![After a drop, the window asks for a new code](docs/window-new-code.png)
 
 ovpn-otp never stores or generates your authenticator secret. The code always comes from your authenticator app.
 
@@ -235,6 +239,7 @@ Start with `ovpn-otp doctor`, which checks each piece in turn. Then look at the 
 | "Login rejected" | Check the code first: wait for a new code in your app and try again. If it keeps failing, re-enter your password (tick **Show** to check it) and save it again. |
 | Connected, but nothing behind the VPN works | Look at **Routes**: the server decides what goes through the VPN. Set a **Reach check** host to see whether the VPN itself carries traffic. On Linux, see the DNS note above. |
 | "Last data received" keeps growing | The link has gone quiet. OpenVPN restarts it after `ping_restart` seconds, and ovpn-otp asks you for a new code. |
+| OpenVPN keeps running after ovpn-otp was force-closed | ovpn-otp stops OpenVPN when you disconnect or close the window, but a crash or a forced kill leaves it running. Stop it from Task Manager (Windows) or with `sudo pkill -f 'openvpn --config .*ovpn-otp'` (Linux), which matches only an OpenVPN started by ovpn-otp. |
 | Cannot read the saved login (Linux) | ovpn-otp needs a keyring through the Secret Service, such as GNOME Keyring or KeePassXC. On a desktop without one, install `gnome-keyring`, or use `--username` with `--password-stdin`. |
 
 When you ask for help, paste the output of **Copy diagnostics** or `ovpn-otp diagnostics`. Your password is never in it, but read it through before you post it publicly: it does contain the server address and the log.

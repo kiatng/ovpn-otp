@@ -411,7 +411,9 @@ impl App {
             _ => Color32::from_rgb(80, 140, 220),
         };
         ui.horizontal(|ui| {
-            ui.label(RichText::new("●").color(color).size(20.0));
+            // A painted dot: the default fonts have no "●" glyph.
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 6.0, color);
             ui.label(RichText::new(s.phase.label()).size(20.0).strong());
             if !s.state.is_empty() && s.phase.is_active() {
                 ui.label(RichText::new(format!("OpenVPN: {} {}", s.state, s.state_detail)).weak());
