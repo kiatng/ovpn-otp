@@ -101,6 +101,7 @@ fn options(code: Option<&str>, password: &str) -> SessionOptions {
         remotes: vec![ovpn_otp_testkit::SERVER.into()],
         remote_count: 1,
         notes: Vec::new(),
+        connect_timeout: Duration::from_secs(60),
     }
 }
 
@@ -669,4 +670,190 @@ fn profile_notes_are_logged_when_the_session_starts() {
     );
     h.disconnect();
     wait_for(&h, &mut seen, "end", is_ended);
+}
+
+/// The states OpenVPN can report. A log line is never one of them.
+fn assert_only_real_states(seen: &[Event]) {
+    for e in seen {
+        if let Event::State { info, .. } = e {
+            assert!(
+                info.name.len() >= 4,
+                "a log line was taken for the state `{}`",
+                info.name
+            );
+        }
+    }
+}
+
+/// The stall first seen with OpenVPN 2.6 on Windows, started directly.
+///
+/// OpenVPN on Windows looks for new commands while it is still answering one
+/// (the fake does the same with `windows_reentry`). A command that arrives in
+/// that moment is lost and the one being answered runs again. The session
+/// used to send the user name and the password in a row: the password was
+/// lost, OpenVPN waited for it for ever, and the window stayed on
+/// "Connecting". Now every command waits for the answer to the one before.
+#[test]
+fn connects_to_an_openvpn_that_reads_while_it_answers() {
+    let mut fake = Fake::new("pw123456");
+    fake.windows_reentry = true;
+    let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
+    let mut seen = Vec::new();
+    wait_for(&h, &mut seen, "CONNECTED", is_connected);
+
+    // Every command ran once, in order, and none was lost.
+    assert_eq!(
+        fake.received(),
+        vec![
+            "log on all",
+            "state on all",
+            "bytecount 1",
+            "hold release",
+            "username \"Auth\" \"alice\"",
+            "password \"Auth\" \"pw123456\"",
+        ]
+    );
+    assert_only_real_states(&seen);
+    let snap = snapshot_of(&seen);
+    assert_eq!(snap.phase, Phase::Connected);
+    assert_eq!(snap.state, "CONNECTED");
+
+    // A drop, a new code and the disconnect go the same careful way.
+    fake.drop_link();
+    wait_for(&h, &mut seen, "need code", |e| need_code(e).is_some());
+    h.send_code("123456");
+    wait_for(&h, &mut seen, "CONNECTED again", is_connected);
+    assert_eq!(fake.password_lines().len(), 2);
+    h.disconnect();
+    let end = wait_for(&h, &mut seen, "end", is_ended);
+    assert!(matches!(
+        end,
+        Event::Ended {
+            reason: EndReason::Disconnected
+        }
+    ));
+    assert_eq!(
+        fake.received().last().map(String::as_str),
+        Some("signal SIGTERM")
+    );
+    assert_only_real_states(&seen);
+}
+
+/// A server that never answers used to leave the session on "Connecting"
+/// for as long as OpenVPN cared to wait. Now a try without progress ends
+/// after the time in the settings, with the step it was stuck in.
+#[test]
+fn a_try_without_progress_ends_with_a_timeout() {
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::Hang]);
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert!(started.elapsed() < Duration::from_secs(8), "took too long");
+    assert_eq!(failure.kind, FailureKind::Timeout);
+    for part in [
+        "Gave up connecting to 198.51.100.7:8443 after 1 seconds without progress",
+        "the server did not answer",
+        "connect.timeout",
+    ] {
+        assert!(
+            failure.message.contains(part),
+            "`{part}` is not in: {}",
+            failure.message
+        );
+    }
+    assert_eq!(need_code_count(&seen), 0);
+    assert!(fake.received().contains(&"signal SIGTERM".to_string()));
+    let snap = snapshot_of(&seen);
+    assert_eq!(snap.phase, Phase::Failed);
+    assert_eq!(snap.failure, Some(FailureKind::Timeout));
+    assert_eq!(snap.headline(chrono::Local::now()).title, "Failed");
+}
+
+/// A server that goes quiet in the given step ends the try with a timeout
+/// that names the step.
+fn assert_stall_times_out(outcome: Outcome, step: &str) {
+    let fake = Fake::new("pw123456").with_plan(&[outcome]);
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::from_secs(1);
+    let started = Instant::now();
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert!(started.elapsed() < Duration::from_secs(8), "took too long");
+    assert_eq!(failure.kind, FailureKind::Timeout);
+    assert!(
+        failure.message.contains(step),
+        "`{step}` is not in: {}",
+        failure.message
+    );
+}
+
+#[test]
+fn a_server_that_hangs_during_login_ends_with_a_timeout() {
+    assert_stall_times_out(Outcome::HangInAuth, "the server did not finish the login");
+}
+
+#[test]
+fn a_server_that_hangs_during_the_config_push_ends_with_a_timeout() {
+    assert_stall_times_out(
+        Outcome::HangInConfig,
+        "the server did not send its settings",
+    );
+}
+
+/// Waiting for the user to type a code is not a stuck try.
+#[test]
+fn waiting_for_a_code_is_not_a_timeout() {
+    let fake = Fake::new("pw123456");
+    let mut opts = options(None, "pw");
+    opts.connect_timeout = Duration::from_secs(1);
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    wait_for(&h, &mut seen, "need code", |e| need_code(e).is_some());
+    std::thread::sleep(Duration::from_millis(2600));
+    h.send_code("123456");
+    wait_for(&h, &mut seen, "CONNECTED", is_connected);
+    // Nor is a tunnel that is up and quiet.
+    std::thread::sleep(Duration::from_millis(2600));
+    h.disconnect();
+    let end = wait_for(&h, &mut seen, "end", is_ended);
+    assert!(matches!(
+        end,
+        Event::Ended {
+            reason: EndReason::Disconnected
+        }
+    ));
+    assert!(!seen
+        .iter()
+        .any(|e| matches!(e, Event::ConnectFailed { .. })));
+}
+
+/// The captured stall itself: OpenVPN took the user name and then never
+/// answered the password command. Even with the connect timeout turned off
+/// the session ends, and it names the command that got no answer.
+#[test]
+fn an_openvpn_that_stops_answering_ends_the_session_with_the_reason() {
+    let fake = Fake::new("pw123456");
+    *fake.ignore.lock().unwrap() = Some("password ".into());
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::ZERO;
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert_eq!(failure.kind, FailureKind::Timeout);
+    assert!(
+        failure
+            .message
+            .contains("OpenVPN stopped answering: no reply to `password \"Auth\" \"********\"")
+            && failure.message.contains("within 10 seconds"),
+        "{}",
+        failure.message
+    );
+    assert!(!failure.message.contains("pw123456"));
+    // The stop command still went out after the one that got no answer.
+    assert!(fake.received().contains(&"signal SIGTERM".to_string()));
+    assert_eq!(snapshot_of(&seen).failure, Some(FailureKind::Timeout));
 }

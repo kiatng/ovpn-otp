@@ -4,7 +4,7 @@ ovpn-otp connects you to an OpenVPN server that wants your 6-digit authenticator
 
 It works with Sophos Firewall SSL VPN and with any other OpenVPN server that expects the code appended to the password. It runs on Windows and Linux, as a small desktop window (`ovpn-otp-gui`) and as a command-line tool (`ovpn-otp`) for scripts and agents.
 
-![The ovpn-otp window, connected: login on the left, status, traffic and the connection timeline on the right](docs/window-connected.png)
+![The ovpn-otp window, connected: a green banner that says Connected, then the connection, server, address, profile and user name in use, the code box and the Disconnect button](docs/window-connected.png)
 
 > [!NOTE]
 > ovpn-otp is an independent open-source project. It is not affiliated with, endorsed by or connected to Sophos or OpenVPN Inc. It uses the free OpenVPN community program to make the actual connection.
@@ -15,10 +15,11 @@ Many firewall VPNs ask for "password followed by your 2FA code" in one masked pa
 
 - **Saved login.** Your user name and password are kept in the credential store of your operating system (Windows Credential Manager, or the desktop keyring on Linux), never in a file.
 - **A separate, visible code box.** You type the 6 digits on their own, in plain sight, and ovpn-otp appends them to the password for you.
+- **Know what you are connected to.** The window and `ovpn-otp status` always show the profile file, the server with the port and protocol, the name of the connection, your user name, and the state in colour and in words: Connected, Connecting…, Disconnected or Failed.
 - **See what is going on.** A live timeline of the connection steps, bytes in and out with the current speed, how long ago data last arrived, your tunnel address, the routes and DNS servers the server sent, an optional check that a host behind the VPN answers (with the round-trip time), a full log with a level filter, and the complete conversation with OpenVPN, with secrets hidden.
 - **Keep-alive and reconnect.** Keep-alive pings detect a dead link, and ovpn-otp reconnects by itself with a growing wait between tries. Because the server wants a fresh code after a real drop, ovpn-otp asks you for one.
-- **A reason when a connect fails.** ovpn-otp tells you whether the server rejected the login, closed the connection without a word, shares no cipher with OpenVPN, or could not be reached. It does not keep asking for code after code while the real problem is somewhere else.
-- **Made for scripts and AI agents too.** Every step works without a window or a terminal, with JSON output and an exit code for each outcome.
+- **A reason when a connect fails.** ovpn-otp tells you whether the server rejected the login, closed the connection without a word, shares no cipher with OpenVPN, or could not be reached. It does not keep asking for code after code while the real problem is somewhere else, and a connect that makes no progress ends by itself with the step it was stuck in.
+- **Made for scripts and AI agents too.** Everything the window does and every setting is a command, with JSON output and an exit code for each outcome.
 - **One settings file for all your machines.** The settings hold no secrets, so you can keep them in a synced folder or a private git repository and use the same file on your Windows PC and your Linux laptop.
 
 ## How it works
@@ -38,6 +39,9 @@ Because the real work is done by OpenVPN, your connection is exactly as secure a
 1. Install the **OpenVPN community client**, version 2.6 or newer, from <https://openvpn.net/community-downloads/> with the default options. The defaults include the "OpenVPN Interactive Service", which lets ovpn-otp start OpenVPN without admin rights. (OpenVPN Connect, the other OpenVPN app, cannot be used: it has no way for another program to drive it.)
 2. Make sure your Windows user is in the **OpenVPN Administrators** group. The installer adds the user who ran it; to add another user, open *Computer Management → Local Users and Groups → Groups → OpenVPN Administrators*, add the user, then sign out and in again. Members of this group may run their own VPN profiles through the service.
 3. Download `ovpn-otp-<version>-x86_64-pc-windows-msvc.zip` from the [releases page](https://github.com/kiatng/ovpn-otp/releases), unzip it anywhere, and start `ovpn-otp-gui.exe`.
+
+> [!TIP]
+> ovpn-otp can also run an `openvpn.exe` (2.6 or newer) that came with another program. Point `openvpn.windows.path` at it and set `openvpn.windows.launch` to `"direct"`. OpenVPN then needs admin rights to create the tunnel, so start ovpn-otp from an administrator window.
 
 ### Linux (Arch, Omarchy, Debian, Ubuntu, ...)
 
@@ -64,9 +68,9 @@ To build from source instead, install Rust and run `cargo build --release`; the 
 You need your VPN profile, a `.ovpn` file. On a Sophos Firewall you download it from the user portal, in the SSL VPN section; other servers have a similar download. If you already imported it into another client, download it again, because ovpn-otp needs the file itself.
 
 1. Put the profile somewhere you like, for example next to your settings file.
-2. Start `ovpn-otp-gui`. It opens on the **Settings** tab because there is no profile yet. Enter the path to the `.ovpn` file and click **Save settings**.
-3. On the left, enter your user name and password. Leave **Remember user name and password** ticked to keep them in the credential store.
-4. Open your authenticator app, type the 6-digit code into **Authenticator code**, and press Enter or click **Connect**.
+2. Start `ovpn-otp-gui`. It opens with **Settings** open because there is no profile yet. Enter the path to the `.ovpn` file in **Profile (.ovpn)** and click **Save settings**. The **Server** and **Profile** rows at the top now show what you will connect to.
+3. Enter your user name and password in the **User** and **Password** rows. Leave **Remember** ticked to keep them in the credential store.
+4. Open your authenticator app, type the 6-digit code into the code box, and press Enter or click **Connect**.
 
 Notice what you did **not** have to do: you never glued the code onto the password, and next time you only type the code.
 
@@ -75,6 +79,7 @@ From the command line the same steps look like this:
 ```sh
 ovpn-otp config init --profile ~/vpn/work.ovpn --name work   # once
 ovpn-otp login                                               # once: saves user name and password
+ovpn-otp status                                              # the profile, server and user name in use
 ovpn-otp connect                                             # asks for the code, shows each step
 ```
 
@@ -84,36 +89,53 @@ ovpn-otp never guesses your user name. It uses the one you typed, either in the 
 
 ## The window
 
-The left side holds the login: user name, password (hidden, with a **Show** toggle), the **Remember** box, and the code box. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server.
+The window is small on purpose: about 420 by 290 points, and only as tall as what it shows. The top part is always there, and it answers three questions at a glance.
 
-The right side shows what is going on:
+**What state is the connection in?** The banner says it in colour and in words:
 
-| Area | What it shows |
+| Banner | Colour | What it adds |
+| --- | --- | --- |
+| **Connected** | green | Your address inside the VPN, and since when. |
+| **Connecting…** | blue | The step OpenVPN is at ("opening a connection to the server", "logging in", ...) and for how long. |
+| **Waiting for your code** | amber | Why a code is needed. |
+| **Reconnecting…** | amber | When the next try starts. |
+| **Disconnected** | grey | Why, when a connection dropped. |
+| **Failed** | red | The reason, in a sentence. |
+
+| | |
 | --- | --- |
-| Status | The overall state (Connecting, Connected, Waiting for your code, Reconnecting, ...) and what OpenVPN itself reports. |
-| Server, Tunnel address | The server in use and the address you got inside the VPN. |
-| Received, Sent | Total bytes and the speed over the last second. |
-| Connected for, Last data received | How long the connection has been up, and how many seconds ago anything arrived. A number that keeps growing means the link has gone quiet. |
-| Reach check | The answer time from a host behind the VPN, when you set one in Settings. |
-| Routes, DNS | What the server told your machine to send through the VPN. |
-| Timeline | Every connection step (CONNECTING, WAIT, AUTH, GET_CONFIG, ASSIGN_IP, ADD_ROUTES, CONNECTED, RECONNECTING, EXITING) with its time. |
+| ![The window before a connect: Disconnected, with the user name, password and code boxes](docs/window-disconnected.png) | ![The window while it connects: Connecting, opening a connection to the server, 3 seconds](docs/window-connecting.png) |
+| ![The window when the connect failed: Failed, with the reason](docs/window-failed.png) | ![The window with Details open: traffic, routes, DNS and the steps of the connection](docs/window-details.png) |
+
+**What am I connecting to?** Below the banner, four rows that never go away: **Connection** (the name in the settings), **Server** (host, port and protocol from the profile), **Profile** (the `.ovpn` file in use) and **User**. While a session runs, an **Address** row shows the address OpenVPN is talking to, when the profile names the server another way.
+
+**What do I do next?** The code box and one button: **Connect**, or **Disconnect** while a session runs. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server. With a saved login the **User** row shows only your user name, with **Change** next to it; the password box comes back when you click that.
+
+Everything else is one click away, on the line at the bottom. A click opens the part and makes the window taller; a second click closes it again.
+
+| Part | What it shows |
+| --- | --- |
+| Details | The state OpenVPN itself reports, the server in use, your tunnel address, how long the connection has been up, bytes received and sent with the speed, how long ago data last arrived (a number that keeps growing means the link has gone quiet), the reach check, routes and DNS, and every step of the connection with the time it happened. The full reason for a failure is here too. |
 | Log | The OpenVPN log and messages from ovpn-otp, with a filter for warnings and errors. |
 | Wire | Every line exchanged with OpenVPN on the management interface. Passwords, codes and session tokens show as `********`. |
+| Settings | The settings for this machine, and **Copy diagnostics**, which puts a troubleshooting report on the clipboard: versions, status, settings, timeline, log and wire transcript. Your password never appears in it, and your user name is replaced with `<user>`. |
 
-**Copy diagnostics** at the bottom puts a troubleshooting report on the clipboard: versions, status, settings, timeline, log and wire transcript. Your password never appears in it, and your user name is replaced with `<user>`.
+The window also shows a session that `ovpn-otp connect` started in a terminal. The banner then says "Started from the command line", and **Disconnect** and the code box work on that session.
+
+![The window showing a session that was started from the command line](docs/window-from-cli.png)
 
 ## Keep-alive and reconnect
 
 Two settings make OpenVPN notice a dead link: it sends a keep-alive **ping** every 10 seconds, and when nothing arrives for 60 seconds it **restarts** the connection. Some servers send their own values, which then take priority.
 
-When a connection drops, ovpn-otp waits a little and tries again: first 2 seconds, then 4, 8 and so on, up to 60 seconds. The server needs a fresh code for the new login, so the window comes to the front, the code box turns orange and says "Reconnecting: enter a new code". In the terminal, `connect` prints a prompt; type the code and press Enter. From another terminal or a script, `ovpn-otp code` gives the code to the waiting session. A code that is more than 90 seconds old is not used, because the server would reject it.
+When a connection drops, ovpn-otp waits a little and tries again: first 2 seconds, then 4, 8 and so on, up to 60 seconds. The server needs a fresh code for the new login, so the window comes to the front, and the banner turns amber and says "Waiting for your code". In the terminal, `connect` prints a prompt; type the code and press Enter. From another terminal or a script, `ovpn-otp code` gives the code to the waiting session. A code that is more than 90 seconds old is not used, because the server would reject it.
 
-![After a drop, the window asks for a new code](docs/window-new-code.png)
+![The window asks for a code: an amber banner that says Waiting for your code, the code box and a Send code button](docs/window-new-code.png)
 
 ovpn-otp never stores or generates your authenticator secret. The code always comes from your authenticator app.
 
 > [!TIP]
-> Turn off **Reconnect automatically** in Settings if you would rather have ovpn-otp stop after a drop.
+> Untick **Reconnect** under Settings (or run `ovpn-otp config set keepalive.auto_reconnect false`) if you would rather have ovpn-otp stop after a drop.
 
 ## Sharing settings between machines
 
@@ -144,7 +166,9 @@ On each machine you save the login once (`ovpn-otp login`, or tick **Remember** 
 
 ## Settings
 
-Every option, with its default. The same list, with comments, is in [`examples/settings.toml`](examples/settings.toml).
+![The window with Settings open](docs/window-settings.png)
+
+Every option, with its default. The same list, with comments, is in [`examples/settings.toml`](examples/settings.toml). You can change each one in the window under **Settings**, in the file, or by name with `ovpn-otp config set`, as [Change settings from the command line](#change-settings-from-the-command-line) shows.
 
 | Option | Default | What it does |
 | --- | --- | --- |
@@ -161,8 +185,9 @@ Every option, with its default. The same list, with comments, is in [`examples/s
 | `check.host` | | A host behind the VPN to check while connected: `10.0.0.1` uses ping, `10.0.0.1:443` opens a TCP connection. Empty turns the check off. |
 | `check.interval` | `15` | Seconds between checks. |
 | `code.digits` | `6` | Digits in your code. 0 accepts any length. |
-| `openvpn.extra_options` | `[]` | Extra OpenVPN options added after the profile, such as `"verb 4"`. See [Extra OpenVPN options](#extra-openvpn-options) for the two ways to write them. |
-| `openvpn.verb` | `3` | How much OpenVPN logs, from 1 (little) to 6 (a lot). |
+| `connect.timeout` | `60` | Seconds a connect may go without progress before ovpn-otp ends it and says where it stuck. OpenVPN gets the same number, so it also gives up a server that does not answer after this long. 0 waits as long as OpenVPN does. |
+| `openvpn.extra_options` | `[]` | Extra OpenVPN options added after the profile, such as `"mute 10"`. See [Extra OpenVPN options](#extra-openvpn-options) for the two ways to write them. |
+| `openvpn.verb` | `3` | How much OpenVPN logs, from 0 (nothing) to 11. 4 and up help when you look for a problem. A `verb` in `extra_options` wins over this setting. |
 | `openvpn.windows.path` | found automatically | Where `openvpn.exe` is. |
 | `openvpn.windows.launch` | `"auto"` | `"service"` starts OpenVPN through the interactive service (no admin rights), `"direct"` runs `openvpn.exe` yourself (needs an admin window), `"auto"` uses the service when it is running. |
 | `openvpn.linux.path` | found automatically | Where `openvpn` is. |
@@ -174,6 +199,7 @@ Before OpenVPN starts, ovpn-otp makes a private copy of your profile with a few 
 
 - **The login comes from ovpn-otp.** `auth-nocache` is added too, so that OpenVPN asks for a fresh login after a drop.
 - **Your keep-alive values** are added at the end, where they take priority over the values in the profile.
+- **The time to wait for a server** (`connect-timeout`) is set to `connect.timeout` from your settings, unless the profile or `extra_options` already says how long to wait.
 - **An old cipher line is made to work.** Many firewall profiles name the cipher with a line such as `cipher AES-128-CBC`. OpenVPN 2.6 and newer ignore that line when they agree a cipher with the server. A server that only accepts AES-128-CBC then finds nothing in common, and it ends the connection right after the secure channel is set up. So when the profile has a `cipher` line and no `data-ciphers` line, ovpn-otp adds two lines: `data-ciphers AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305:AES-128-CBC` (the ciphers OpenVPN offers, plus the one from your profile) and `data-ciphers-fallback AES-128-CBC` (for servers that cannot agree a cipher at all). ovpn-otp does this for AES, Camellia, ARIA and ChaCha20 ciphers.
 - **Private server addresses are skipped.** Some profiles list the server twice: by the public address, and by the address inside the office network, such as `10.255.0.1`. From outside the office the second address never answers, and OpenVPN can wait two minutes on it. When a profile has both kinds, ovpn-otp leaves out the private ones. Set `allow_private_remotes = true` under `[profile]` to try them too. A profile with only private addresses is used as it is.
 
@@ -204,30 +230,89 @@ Or as on the `openvpn` command line, each word as its own item:
 extra_options = ["--data-ciphers", "AES-256-GCM:AES-128-CBC", "--verb", "4"]
 ```
 
-Both give OpenVPN the same two lines, `data-ciphers AES-256-GCM:AES-128-CBC` and `verb 4`. In the second way, an item that starts with `--` starts an option, and the items after it are the parameters for that option.
+Both give OpenVPN the same two options, `data-ciphers AES-256-GCM:AES-128-CBC` and `verb 4`. In the second way, an item that starts with `--` starts an option, and the items after it are the parameters for that option.
+
+`verb` is the one option that ovpn-otp does not write into the profile copy. Because OpenVPN takes the log level from the command line it was started with, ovpn-otp puts the level there, once: from a `verb` in `extra_options` when there is one, or else from `openvpn.verb`, or else 3.
 
 **Do not put an item without `--` before the first item with `--`**, because nothing says which option it belongs to. ovpn-otp then does not connect, and it names the item: `extra_options item 1 ("verb 4") comes before the first item that starts with "--".` Run `ovpn-otp doctor` to check the format and to see the lines OpenVPN will get.
 
 ## Command line
 
-`ovpn-otp` does everything the window does. A session started by the window can also be checked and stopped from the command line, and the other way round.
+`ovpn-otp` does everything the window does, and reaches every setting. A session started by the window can also be checked and stopped from the command line, and the other way round.
 
 | Command | What it does |
 | --- | --- |
 | `ovpn-otp connect` | Connect and stay connected until Ctrl+C. Asks for the code, or takes it with `--code-stdin` or `--code 123456`. With `--background` it starts the session as its own process and returns when the tunnel is up or the connect has failed. |
+| `ovpn-otp disconnect` | Stop the running session. |
+| `ovpn-otp reconnect` | Stop the running session, if there is one, and connect again. Takes the same options as `connect`. |
+| `ovpn-otp status` | Show the state, and the profile, server and user name in use. While a session runs, also the address, traffic, last data, check and routes. |
 | `ovpn-otp code` | Give a code to a session that is waiting for one: `ovpn-otp code --stdin`, or `ovpn-otp code 123456`. |
 | `ovpn-otp wait` | Wait until the session is connected or gone: `--until connected` or `--until disconnected`, with `--timeout SECONDS` (60 when left out). |
-| `ovpn-otp status` | Show the running session: state, server, address, traffic, last data, check, routes. `--json` prints it with fixed field names. |
-| `ovpn-otp logs` | Print the session log. `-f` keeps following it, `--wire` adds the management transcript, `-n 50` shows the last 50 lines, `--json` prints one JSON object per line. |
-| `ovpn-otp disconnect` | Stop the running session. |
-| `ovpn-otp login` / `logout` | Save or remove the user name and password in the credential store. |
-| `ovpn-otp config path` / `show` / `init` | Show where the settings file is, print it, or create one for a profile. |
-| `ovpn-otp diagnostics` | Print the troubleshooting report, with secrets removed. |
+| `ovpn-otp logs` | Print the session log. `-f` keeps following it, `--wire` adds the management transcript, `-n 50` shows the last 50 lines, `--level warning` shows only warnings and errors. |
+| `ovpn-otp profile show` / `set FILE` / `list` | Show the profile in use and the servers in it, use another `.ovpn` file, or list the `.ovpn` files next to the settings file and in the folder where OpenVPN keeps profiles. |
+| `ovpn-otp config show` / `get KEY` / `set KEY VALUE` / `unset KEY` / `keys` / `path` / `edit` / `init` | Print the settings, read or change one by name, put one back to the default, list every setting with what it does, show where the settings file is, open it in your editor, or create it for a profile. |
+| `ovpn-otp login set` / `show` / `clear` | Save the user name and password in the credential store, show the saved user name (never the password), or remove the saved login. `ovpn-otp login` alone saves, and `ovpn-otp logout` removes. |
 | `ovpn-otp doctor` | Check the settings, the extra options, the profile, OpenVPN, the privileges and the saved login. |
+| `ovpn-otp diagnostics` | Print the troubleshooting report, with secrets removed. |
 
-In a terminal, `connect` asks you for what it needs: the login when none is saved, and the code. When the first login fails it says why and ends, except for a rejected login, where it asks you for a new code.
+**Every command that prints data takes `--json`**: `status`, `connect --background`, `disconnect`, `reconnect --background`, `wait`, `logs`, `profile show`, `profile list`, `config show`, `config get`, `config keys`, `login show` and `doctor`. The password and the code are never printed, with or without `--json`.
+
+In a terminal, `connect` first says what it uses (connection, profile, server and user name), then asks you for what it needs: the login when none is saved, and the code. When the first login fails it says why and ends, except for a rejected login, where it asks you for a new code.
 
 There is no background service: whichever program started the session (the window or `connect`) runs it, and the other commands talk to it through small files in a private folder (`$XDG_RUNTIME_DIR/ovpn-otp` on Linux, `%LOCALAPPDATA%\ovpn-otp\data\run` on Windows; `OVPN_OTP_RUNTIME_DIR` overrides it).
+
+### What `status` prints
+
+`status` always starts with the state and with what is in use, whether a session runs or not:
+
+```
+State:      Connected: address 10.8.0.6, since 14:02:11 (12m 3s)
+Connection: work
+Settings:   /home/alice/Sync/vpn/settings.toml
+Profile:    /home/alice/Sync/vpn/work.ovpn
+Server:     vpn.example.org:8443 (tcp), now at 203.0.113.10:8443
+User:       alice
+```
+
+The first line reads `Connecting…: logging in (12s)` while a connect is under way, `Disconnected` when nothing runs, and `Failed: ` with the reason after a connect that failed. In a terminal the state word is coloured the way the banner in the window is: green, blue, amber, grey or red. Set `NO_COLOR` to turn the colour off.
+
+Without a running session, the lines say what the next connect would use, so you can check the profile and the server before you connect.
+
+### Change settings from the command line
+
+A setting has the name it has in the settings file, with a dot between the section and the option: `ping` under `[keepalive]` is `keepalive.ping`. Here is how to read one, change it and put it back:
+
+```sh
+ovpn-otp config get keepalive.ping          # 10
+ovpn-otp config set keepalive.ping 20
+ovpn-otp config unset keepalive.ping        # back to the default
+ovpn-otp config keys                        # every setting with the value and what it does
+```
+
+A list takes one word for each item, and a setting that is on or off takes `true` or `false`:
+
+```sh
+ovpn-otp config set openvpn.extra_options "mute 10" "disable-dco"
+ovpn-otp config set openvpn.linux.command_prefix sudo -n
+ovpn-otp config set keepalive.auto_reconnect false
+```
+
+`config set` checks the value before it saves. A name that does not exist, or a value of the wrong kind, ends with exit code 2 and a message such as ``there is no setting `ping`. Did you mean keepalive.ping?``, and the file stays as it was. `config edit` opens the file in your editor (`$VISUAL`, then `$EDITOR`) and checks it when you close the editor.
+
+The profile and the saved login have their own commands:
+
+```sh
+ovpn-otp profile list                       # the .ovpn files found, * marks the one in use
+ovpn-otp profile set ~/vpn/office.ovpn      # use this one from now on
+ovpn-otp profile show                       # the file, the servers in it and what ovpn-otp changes
+
+printf '%s\n' "$VPN_PASSWORD" | ovpn-otp login set --username "$VPN_USER" --password-stdin
+ovpn-otp login show                         # the saved user name; the password is never shown
+ovpn-otp login clear
+```
+
+> [!NOTE]
+> A running session keeps the settings it started with. After a change, run `ovpn-otp reconnect` to use the new ones.
 
 ## Using it from scripts and AI agents
 
@@ -264,10 +349,10 @@ Notice what the script did **not** have to do: it never watched the output for a
 | 4 | server_reset, cipher_mismatch | The server closed the connection during login and gave no reason, or the server and OpenVPN have no cipher in common. |
 | 5 | unreachable | No server answered. |
 | 6 | needs_code | The session is waiting for an authenticator code. |
-| 7 | timeout | The time given with `--timeout` ran out. |
+| 7 | timeout | A time limit ran out: the one given with `--timeout`, or the connect made no progress for `connect.timeout` seconds. |
 | 8 | dropped | A working connection dropped and reconnecting is turned off. |
 
-`connect --background` and `wait` end with these codes. `connect` in the foreground ends with 0 after a normal disconnect, and with the code for the failure otherwise. `status` and `logs` end with 0 whenever they could print.
+`connect --background`, `reconnect --background` and `wait` end with these codes. `connect` in the foreground ends with 0 after a normal disconnect, and with the code for the failure otherwise. `status` and `logs` end with 0 whenever they could print. The commands for settings (`config`, `profile`, `login`) end with 0 when they did what you asked, 2 when the name or the value was wrong, and 1 when something else failed, such as a profile file that is not there.
 
 When a first connect fails, the session ends and nothing is left running, so the script can fix the cause and run `connect` again.
 
@@ -284,7 +369,11 @@ ovpn-otp wait --until connected --timeout 60
 
 ### Timeouts
 
-The two timeouts do different things. `connect --background --timeout 30` gives up after 30 seconds, **stops the session** and ends with 7. When you leave `--timeout` out, it waits 150 seconds, which is longer than the 120 seconds OpenVPN itself waits on a server that does not answer. `wait --timeout 30` only stops waiting and ends with 7, and the session carries on.
+There are three timeouts, and they do different things.
+
+- **`connect.timeout` in the settings (60 seconds)** ends a connect that makes no progress. The session stops by itself, and the reason names the step: for example "Gave up connecting to 203.0.113.10:8443 after 60 seconds without progress: the server did not answer." The exit code is 7 and `failure_reason` is `timeout`. Waiting for you to type a code does not count as no progress.
+- **`connect --background --timeout 30`** gives up after 30 seconds, whatever the session is doing, **stops the session** and ends with 7. When you leave `--timeout` out, it waits 150 seconds.
+- **`wait --timeout 30`** only stops waiting and ends with 7, and the session carries on.
 
 ### What `status --json` prints
 
@@ -294,9 +383,11 @@ Every field is always there. A field without a value is `null`.
 | --- | --- |
 | `running` | `true` while a session is running. |
 | `phase` | `idle`, `starting`, `connecting`, `need_code`, `connected`, `reconnecting`, `disconnecting`, `disconnected` or `failed`. |
+| `state`, `state_detail` | The state in words, as the window shows it (`Connected`, `Connecting…`, `Waiting for your code`, `Reconnecting…`, `Disconnecting…`, `Disconnected` or `Failed`), and what goes with it: the address and time, the step and time, or the reason. For people; a script should read `phase`. |
+| `step` | What OpenVPN is doing while it connects, such as `logging in`. |
 | `needs_code` | `true` while the session waits for a code. |
 | `code_reason` | Why it needs one: `initial`, `reconnect`, `rejected`, `expired`, or `retry` (the last try to reconnect failed). |
-| `failure_reason` | Why the last try failed: `auth_failed`, `server_reset`, `cipher_mismatch`, `unreachable`, `dropped` or `failed`. `null` once connected. |
+| `failure_reason` | Why the last try failed: `auth_failed`, `server_reset`, `cipher_mismatch`, `unreachable`, `dropped`, `timeout` or `failed`. `null` once connected. |
 | `last_error` | The message that goes with `failure_reason`, with the likely causes. |
 | `remote` | The server in use or being tried, as `host:port`. |
 | `local_ip` | The address of your machine inside the VPN. |
@@ -306,7 +397,9 @@ Every field is always there. A field without a value is `null`.
 | `openvpn_state` | The state OpenVPN itself reports, such as `CONNECTED` or `WAIT`. |
 | `reconnect_attempt`, `next_retry` | How many times it has tried to reconnect, and when the next try starts. |
 | `routes`, `dns` | What the server told your machine to send through the VPN. |
-| `name`, `settings`, `pid`, `updated` | The connection name, the settings file, the process that runs the session, and when this status was written. |
+| `name`, `settings` | The connection name and the settings file. |
+| `profile`, `servers`, `username` | The profile file in use, the servers it points at with the protocol (such as `vpn.example.org:8443 (tcp)`), and the user name of the login. A running session reports what it uses; without one, these say what the next connect would use. |
+| `pid`, `updated` | The process that runs the session, and when this status was written. |
 
 Here is what a script sees after the server closed the connection during login:
 
@@ -365,7 +458,7 @@ OpenVPN 2.7 and newer handle DNS through their built-in `dns-updown` script.
 
 ## Troubleshooting
 
-Start with `ovpn-otp doctor`, which checks each piece in turn. Then look at the **Log** and **Wire** tabs (or `ovpn-otp logs --wire`).
+Start with `ovpn-otp doctor`, which checks each piece in turn. Then open **Log** and **Wire** in the window (or run `ovpn-otp logs --wire`).
 
 | What you see | What to do |
 | --- | --- |
@@ -376,9 +469,13 @@ Start with `ovpn-otp doctor`, which checks each piece in turn. Then look at the 
 | "Login rejected", or "The server rejected the login" | Check the code first: wait for a new code in your app and try again. If it keeps failing, re-enter your password (tick **Show** to check it) and save it again. |
 | "The server ... closed the connection during login and gave no reason" | The secure channel was set up, then the server hung up without an answer. Some firewalls do this instead of saying what is wrong. Wait for the next code and try once more, because a code works only once. Then check the password. If it still fails, the cause may be the cipher: look for "cipher" in `ovpn-otp logs`, and see [What ovpn-otp changes in your profile](#what-ovpn-otp-changes-in-your-profile). |
 | "The server ... and OpenVPN have no encryption cipher in common" | The server uses a cipher that OpenVPN did not offer. Add it with `extra_options`, for example `"data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC"`, with the cipher your VPN administrator names in place of the last one. |
-| "Could not reach the VPN server" | Check your network connection, then the server address and port in the profile. The message includes what OpenVPN said, such as "Connection timed out". |
+| "Could not reach the VPN server" | Check your network connection, then the server address and port in the profile (`ovpn-otp profile show`). The message includes what OpenVPN said, such as "Connection timed out". |
+| "Gave up connecting ... without progress" | The connect stood still for `connect.timeout` seconds, and the message names the step it stood at. "The server did not answer" points at the network or the server address. For a slow server, give it more time with `ovpn-otp config set connect.timeout 120`. |
+| "OpenVPN stopped answering" | OpenVPN did not reply to ovpn-otp within 10 seconds. Run `ovpn-otp logs --wire` to see the last lines, and `ovpn-otp doctor` to check which OpenVPN program is used. |
+| The window stayed on "Connecting" for ever (version 0.2.0, Windows) | Update to 0.3.0 or newer. OpenVPN on Windows loses a command that arrives while it is still answering another one, and 0.2.0 sent the user name and the password in a row. See [Why commands go one at a time](#why-commands-go-one-at-a-time). |
+| You are not sure which profile or server is used | `ovpn-otp status` and the top of the window show the connection, the profile file, the server with the port and protocol, and the user name. Change the profile with `ovpn-otp profile set FILE`. |
 | "OpenVPN did not accept an option", or "Options error" in the log | An option in the profile or in `extra_options` is not one OpenVPN knows, or it is written the wrong way. Run `ovpn-otp doctor` and see [Extra OpenVPN options](#extra-openvpn-options). |
-| Connected, but nothing behind the VPN works | Look at **Routes**: the server decides what goes through the VPN. Set a **Reach check** host to see whether the VPN itself carries traffic. On Linux, see the DNS note above. |
+| Connected, but nothing behind the VPN works | Look at **Routes** under Details: the server decides what goes through the VPN. Set a **Reach check host** under Settings to see whether the VPN itself carries traffic. On Linux, see the DNS note above. |
 | "Last data received" keeps growing | The link has gone quiet. OpenVPN restarts it after `ping_restart` seconds, and ovpn-otp asks you for a new code. |
 | OpenVPN keeps running after ovpn-otp was force-closed | ovpn-otp stops OpenVPN when you disconnect or close the window, but a crash or a forced kill leaves it running. Stop it from Task Manager (Windows) or with `sudo pkill -f 'openvpn --config .*ovpn-otp'` (Linux), which matches only an OpenVPN started by ovpn-otp. |
 | Cannot read the saved login (Linux) | ovpn-otp needs a keyring through the Secret Service, such as GNOME Keyring or KeePassXC. On a desktop without one, install `gnome-keyring`, or give your user name with `--username` and the password with `--password-stdin`. |
@@ -409,7 +506,26 @@ cargo test --workspace            # unit tests, and session and command-line tes
 tests/integration/run.sh          # a real OpenVPN server and client, Linux only
 ```
 
-The fake OpenVPN plays each way a connect can go: a good login, a rejected one, a server that closes the connection during login, a server that does not answer, and a server with no cipher in common. The command-line tests run the real `ovpn-otp` program against it, as a script would, and check the exit code and the JSON for each case.
+The fake OpenVPN plays each way a connect can go: a good login, a rejected one, a server that closes the connection during login, a server that does not answer, a server that never finishes, and a server with no cipher in common. The command-line tests run the real `ovpn-otp` program against it, as a script would, and check the exit code and the JSON for each case.
+
+### Why commands go one at a time
+
+ovpn-otp sends OpenVPN one management command, waits for the whole answer, and only then sends the next. This is a rule and not a matter of style, **because OpenVPN on Windows loses commands otherwise**. While OpenVPN on Windows writes the answer to a command, it looks at the management socket again. A command that arrives in that moment is put behind the one still being answered, and when OpenVPN reads the command back, it gets the old one a second time and never sees the new one.
+
+Version 0.2.0 sent the user name and the password in a row. OpenVPN answered "user name entered" twice, never saw the password, and waited for it for ever, so the window stayed on "Connecting". The setup commands were hit the same way: `state on all` was lost, `log on all` ran twice, and the second copy of the log was read as states, which is how a state named `D` showed up.
+
+The fake OpenVPN can read the socket the same way (`windows_reentry` in `crates/testkit`). One test sends the commands in a row and gets exactly the captured exchange back; another runs the session against it and checks that every command arrives once and the tunnel comes up. In the code, `Engine::send` in `crates/core/src/session.rs` is the only way a command reaches OpenVPN.
+
+### Pictures of the window
+
+The pictures in this README come from the window itself. A build with the `screenshots` feature saves a picture of the window to a file and closes, so the pictures can be made again after a change:
+
+```sh
+cargo build -p ovpn-otp-gui --features screenshots
+OVPN_OTP_GUI_SCREENSHOT=window.png target/debug/ovpn-otp-gui settings.toml
+```
+
+`crates/gui/src/shot.rs` lists the other variables, such as the one that opens Details or Settings for the picture. A release build does not have this feature.
 
 The integration test builds a throwaway certificate authority, starts an OpenVPN server whose login script accepts one test user with password + a fixed test code, and runs the library and the CLI against it. It proves connect, the state timeline, byte counts, the reach check, a server-side drop with reconnect and a fresh code, a rejected code, and disconnect. It runs inside a private network namespace, so it needs `openvpn`, `openssl` and `unshare` but no root, and it cannot touch your real network.
 

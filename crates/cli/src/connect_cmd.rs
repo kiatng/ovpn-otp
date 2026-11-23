@@ -156,11 +156,14 @@ enum Input {
 fn run_session(prepared: Prepared, rt: RuntimeDir, loaded: &LoadedSettings, ui: Ui) -> Result<u8> {
     let digits = loaded.settings.code.digits;
     if !ui.quiet {
-        if let Some(r) = prepared.remotes.first() {
-            eprintln!("Connecting to {r} (settings: {})", loaded.path.display());
-        }
+        // Say what is used before anything is tried.
+        let using = &prepared.using;
+        eprintln!("Connection: {} ({})", using.name, using.settings);
+        eprintln!("Profile:    {}", using.profile);
+        eprintln!("Server:     {}", using.servers.join(", "));
+        eprintln!("User:       {}", using.username);
     }
-    let mut rec = Recorder::new(rt.clone(), &loaded.settings.name, &loaded.path);
+    let mut rec = Recorder::new(rt.clone(), prepared.using.clone());
     let (h, config_path) = prepared.start();
 
     let (ui_tx, ui_rx) = mpsc::channel();
@@ -338,7 +341,7 @@ fn connect_background(
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(st) = own_status() {
-            let report = StatusReport::from_status(Some(&st));
+            let report = StatusReport::from_status(Some(&st), None);
             if let Some(code) = wait_verdict(&report, WaitTarget::Connected) {
                 return finish(&report, code);
             }
@@ -346,7 +349,7 @@ fn connect_background(
         if child.try_wait()?.is_some() {
             // It ended: the last status it wrote says how.
             if let Some(st) = own_status() {
-                let report = StatusReport::from_status(Some(&st));
+                let report = StatusReport::from_status(Some(&st), None);
                 let code =
                     wait_verdict(&report, WaitTarget::Connected).unwrap_or(exit_code::FAILED);
                 return finish(&report, code);
@@ -376,7 +379,7 @@ fn connect_background(
             if json {
                 println!(
                     "{}",
-                    StatusReport::from_status(own_status().as_ref()).to_json()
+                    StatusReport::from_status(own_status().as_ref(), None).to_json()
                 );
             }
             return Ok(exit_code::TIMEOUT);

@@ -29,7 +29,9 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo fmt --all --check
       - name: Lint
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        # --all-features also checks the picture helper of the window, which a
+        # release build leaves out.
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
       - name: Unit and fake-server tests
         run: cargo test --workspace --locked
 

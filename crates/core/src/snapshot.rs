@@ -51,6 +51,71 @@ impl Phase {
     pub fn is_active(self) -> bool {
         !matches!(self, Phase::Idle | Phase::Disconnected | Phase::Failed)
     }
+
+    /// Whether the session is working towards a connection by itself.
+    pub fn is_connecting(self) -> bool {
+        matches!(
+            self,
+            Phase::Starting | Phase::Connecting | Phase::Reconnecting
+        )
+    }
+}
+
+/// What kind of news a [`Headline`] is, for the colour it is shown in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tone {
+    /// Connected.
+    Good,
+    /// Working on it.
+    Busy,
+    /// The user has to do something, or the connection is being restored.
+    Attention,
+    /// Failed.
+    Bad,
+    /// Nothing is running.
+    Idle,
+}
+
+/// The state of the session in words, the same in the window and in
+/// `ovpn-otp status`: a short title and the detail that goes with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Headline {
+    pub tone: Tone,
+    /// `Connected`, `Connecting…`, `Disconnected`, `Failed`, ...
+    pub title: String,
+    /// The address and time when connected, the step and time while
+    /// connecting, the reason when failed. May be empty.
+    pub detail: String,
+}
+
+impl Headline {
+    /// Title and detail on one line.
+    pub fn line(&self) -> String {
+        if self.detail.is_empty() {
+            self.title.clone()
+        } else {
+            format!("{}: {}", self.title, self.detail)
+        }
+    }
+}
+
+/// What OpenVPN is doing in a state, in plain words.
+pub fn step_label(state: &str) -> &'static str {
+    match state {
+        "" => "starting OpenVPN",
+        "INITIAL" | "CONNECTING" => "getting ready",
+        "RESOLVE" => "looking up the server",
+        "TCP_CONNECT" => "opening a connection to the server",
+        "WAIT" => "waiting for the server to answer",
+        "AUTH" => "logging in",
+        "AUTH_PENDING" => "waiting for the server to accept the login",
+        "GET_CONFIG" => "getting settings from the server",
+        "ASSIGN_IP" => "setting the tunnel address",
+        "ADD_ROUTES" => "adding routes",
+        "RECONNECTING" => "starting again",
+        "EXITING" => "stopping",
+        _ => "working",
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -81,6 +146,9 @@ pub struct Snapshot {
     pub phase: Phase,
     /// When the session entered the current phase.
     pub phase_since: Option<DateTime<Local>>,
+    /// When the session started working towards a connection, while it does.
+    #[serde(default)]
+    pub connecting_since: Option<DateTime<Local>>,
     /// OpenVPN's own state name (`CONNECTED`, `WAIT`, ...).
     pub state: String,
     pub state_detail: String,
@@ -136,6 +204,94 @@ impl Snapshot {
         self.fold(ev);
         if self.phase != before || self.phase_since.is_none() {
             self.phase_since = Some(Local::now());
+        }
+        if !self.phase.is_connecting() {
+            self.connecting_since = None;
+        } else if self.connecting_since.is_none() {
+            self.connecting_since = Some(Local::now());
+        }
+    }
+
+    /// What OpenVPN is doing right now, while the session is connecting.
+    pub fn step(&self) -> Option<&'static str> {
+        match self.phase {
+            Phase::Starting => Some(step_label("")),
+            Phase::Connecting | Phase::Reconnecting => Some(step_label(&self.state)),
+            _ => None,
+        }
+    }
+
+    /// The state of the session in words. See [`Headline`].
+    pub fn headline(&self, now: DateTime<Local>) -> Headline {
+        let elapsed = |since: Option<DateTime<Local>>| {
+            since.map(|t| format_duration((now - t).num_seconds()))
+        };
+        let (tone, title, detail) = match self.phase {
+            Phase::Idle => (Tone::Idle, "Disconnected", String::new()),
+            Phase::Disconnected => (
+                Tone::Idle,
+                "Disconnected",
+                // A dropped connection says why.
+                self.last_error
+                    .clone()
+                    .filter(|_| self.failure == Some(FailureKind::Dropped))
+                    .unwrap_or_default(),
+            ),
+            Phase::Failed => (
+                Tone::Bad,
+                "Failed",
+                self.last_error.clone().unwrap_or_default(),
+            ),
+            Phase::Connected => {
+                let mut parts = Vec::new();
+                if !self.local_ip.is_empty() {
+                    parts.push(format!("address {}", self.local_ip));
+                }
+                if let Some(since) = self.connected_since {
+                    parts.push(format!(
+                        "since {} ({})",
+                        since.format("%H:%M:%S"),
+                        format_duration((now - since).num_seconds())
+                    ));
+                }
+                (Tone::Good, "Connected", parts.join(", "))
+            }
+            Phase::NeedCode => (
+                Tone::Attention,
+                "Waiting for your code",
+                match self.code_reason {
+                    Some(CodeReason::Reconnect) => "the connection dropped; enter a new code",
+                    Some(CodeReason::Rejected) => "the login was rejected; enter a new code",
+                    Some(CodeReason::Expired) => "the code was too old; enter a new one",
+                    Some(CodeReason::Retry) => "the last try failed; enter a new code",
+                    _ => "the server asks for your authenticator code",
+                }
+                .to_string(),
+            ),
+            Phase::Disconnecting => (Tone::Busy, "Disconnecting…", String::new()),
+            Phase::Starting | Phase::Connecting | Phase::Reconnecting => {
+                let mut detail = self.step().unwrap_or("working").to_string();
+                if let Some(at) = self.next_retry.filter(|t| *t > now) {
+                    detail = format!(
+                        "try {} starts in {}",
+                        self.reconnect_attempt,
+                        format_duration((at - now).num_seconds())
+                    );
+                }
+                if let Some(e) = elapsed(self.connecting_since) {
+                    detail = format!("{detail} ({e})");
+                }
+                if self.phase == Phase::Reconnecting {
+                    (Tone::Attention, "Reconnecting…", detail)
+                } else {
+                    (Tone::Busy, "Connecting…", detail)
+                }
+            }
+        };
+        Headline {
+            tone,
+            title: title.to_string(),
+            detail,
         }
     }
 
@@ -577,6 +733,90 @@ mod tests {
         s.apply(&state("WAIT", ""));
         assert!(s.phase_since.unwrap() >= started);
         assert_eq!(s.phase, Phase::Connecting);
+    }
+
+    /// The state line that the window and `ovpn-otp status` both show.
+    #[test]
+    fn the_headline_says_the_state_in_words() {
+        let now = Local::now();
+        let mut s = Snapshot::default();
+        let h = s.headline(now);
+        assert_eq!((h.tone, h.line().as_str()), (Tone::Idle, "Disconnected"));
+
+        s.apply(&Event::Launching {
+            at: now,
+            attempt: 0,
+        });
+        s.connecting_since = Some(now - chrono::Duration::seconds(3));
+        let h = s.headline(now);
+        assert_eq!(h.tone, Tone::Busy);
+        assert_eq!(h.line(), "Connecting…: starting OpenVPN (3s)");
+
+        s.apply(&state("TCP_CONNECT", ""));
+        assert_eq!(s.step(), Some("opening a connection to the server"));
+        s.apply(&state("AUTH", ""));
+        s.connecting_since = Some(now - chrono::Duration::seconds(12));
+        assert_eq!(s.headline(now).line(), "Connecting…: logging in (12s)");
+
+        s.apply(&Event::NeedCode {
+            reason: CodeReason::Rejected,
+        });
+        let h = s.headline(now);
+        assert_eq!(h.tone, Tone::Attention);
+        assert_eq!(h.title, "Waiting for your code");
+        assert!(h.detail.contains("rejected"), "{}", h.detail);
+        assert_eq!(s.connecting_since, None, "the wait is for the user");
+
+        s.apply(&Event::LoginSent { at: now });
+        assert!(s.connecting_since.is_some());
+        s.apply(&state("CONNECTED", "10.8.0.6"));
+        s.connected_since = Some(now - chrono::Duration::seconds(75));
+        let h = s.headline(now);
+        assert_eq!(h.tone, Tone::Good);
+        assert_eq!(h.title, "Connected");
+        assert!(
+            h.detail.starts_with("address 10.8.0.6, since "),
+            "{}",
+            h.detail
+        );
+        assert!(h.detail.ends_with("(1m 15s)"), "{}", h.detail);
+        assert_eq!(s.step(), None);
+
+        s.apply(&Event::Reconnecting {
+            at: now,
+            attempt: 2,
+            delay: std::time::Duration::from_secs(4),
+            reason: "ping-restart".into(),
+        });
+        let h = s.headline(now);
+        assert_eq!(h.tone, Tone::Attention);
+        assert!(
+            h.line().starts_with("Reconnecting…: try 2 starts in"),
+            "{}",
+            h.line()
+        );
+
+        s.apply(&Event::Ended {
+            reason: EndReason::Failed(Failure::new(FailureKind::Timeout, "gave up")),
+        });
+        let h = s.headline(now);
+        assert_eq!((h.tone, h.line().as_str()), (Tone::Bad, "Failed: gave up"));
+
+        let mut s = Snapshot::default();
+        s.apply(&Event::Ended {
+            reason: EndReason::Dropped("ping-restart".into()),
+        });
+        assert_eq!(
+            s.headline(now).line(),
+            "Disconnected: Connection dropped: ping-restart"
+        );
+        s.apply(&Event::Ended {
+            reason: EndReason::Disconnected,
+        });
+        // Every state OpenVPN reports has words.
+        for name in ["RESOLVE", "WAIT", "GET_CONFIG", "ASSIGN_IP", "ADD_ROUTES"] {
+            assert_ne!(step_label(name), "working", "{name}");
+        }
     }
 
     #[test]

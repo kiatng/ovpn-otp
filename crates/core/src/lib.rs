@@ -2,6 +2,7 @@
 //! management interface, with a saved login and a separate authenticator code.
 //!
 //! * [`settings`] — the shared TOML settings file (no secrets in it);
+//! * [`keys`] — read and change one setting by its name;
 //! * [`credentials`] — the saved login in the OS credential store;
 //! * [`profile`] — turn a `.ovpn` profile into the config OpenVPN runs;
 //! * [`launch`] — start OpenVPN (directly, or via the Windows interactive service);
@@ -16,6 +17,7 @@
 pub mod connect;
 pub mod credentials;
 pub mod diagnostics;
+pub mod keys;
 pub mod launch;
 pub mod mgmt;
 pub mod profile;
