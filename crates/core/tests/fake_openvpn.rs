@@ -857,3 +857,69 @@ fn an_openvpn_that_stops_answering_ends_the_session_with_the_reason() {
     assert!(fake.received().contains(&"signal SIGTERM".to_string()));
     assert_eq!(snapshot_of(&seen).failure, Some(FailureKind::Timeout));
 }
+
+/// The 0.3.0 report on Windows: OpenVPN waits at the hold, but its `>HOLD`
+/// notice never arrives (the output queue was thrown away by a command that
+/// came in while the notice was being written). The setup commands are
+/// answered, so the session releases the hold itself and the connect goes on.
+#[test]
+fn a_hold_notice_that_never_arrives_does_not_stop_the_connect() {
+    let mut fake = Fake::new("pw123456");
+    fake.skip_hold_notice = true;
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::from_secs(3);
+    let started = Instant::now();
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    wait_for(&h, &mut seen, "CONNECTED", is_connected);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "the hold was only released by the timeout"
+    );
+    // The hold was released once, and the login went to OpenVPN.
+    assert_eq!(fake.shared.hold_releases.lock().unwrap().len(), 1);
+    assert_eq!(
+        fake.password_lines(),
+        vec!["password \"Auth\" \"pw123456\""]
+    );
+    h.disconnect();
+    wait_for(&h, &mut seen, "end", is_ended);
+}
+
+/// A message for a try that stood still before any state arrived says what
+/// really happened: the hold was never released, or it was and OpenVPN still
+/// did not connect. The old text ("OpenVPN did not start to connect") was the
+/// same for both and pointed at nothing.
+#[test]
+fn a_stall_before_the_first_state_says_where_it_stood() {
+    // The hold was released and OpenVPN then reported a server that does not
+    // answer: the message names that step, not an OpenVPN that "did not start
+    // to connect" (which is what it said before, whatever had happened).
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::Hang]);
+    let mut opts = options(Some("123456"), "pw");
+    opts.connect_timeout = Duration::from_secs(1);
+    let h = session::start(opts, launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert_eq!(failure.kind, FailureKind::Timeout);
+    assert!(
+        failure.message.contains("the server did not answer"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        !failure.message.contains("did not start to connect"),
+        "{}",
+        failure.message
+    );
+    // And the hold really was released before that, so the message could not
+    // say it was still held.
+    assert_eq!(fake.shared.hold_releases.lock().unwrap().len(), 1);
+    // The whole reason is in the log, for `ovpn-otp logs` to show.
+    assert!(
+        seen.iter()
+            .any(|e| matches!(e, Event::ConnectFailed { failure: f, .. }
+            if f.message == failure.message)),
+        "the reason is not among the events"
+    );
+}
