@@ -41,6 +41,16 @@
 //! [`SessionOptions::connect_timeout`] ends with [`FailureKind::Timeout`], and
 //! so does an OpenVPN that does not answer a command. The session never stays
 //! on "connecting" without an end.
+//!
+//! How the hold is released: not only when OpenVPN's `>HOLD` arrives. OpenVPN
+//! can wait at the hold without the notice ever arriving: `>HOLD` is one line
+//! in its output queue, and the queue is thrown away when a command arrives
+//! while it is being written (`man_read` resets the output list, and on
+//! Windows a command is read again before every write). The 0.3.0 session on
+//! Windows stood exactly there: the setup commands were answered, `hold
+//! release` never went out, and nothing happened until the connect timeout.
+//! So once the setup commands are answered, the session releases the hold
+//! itself, without waiting for a notice that may never come.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -437,7 +447,11 @@ struct Engine {
     /// The one command OpenVPN is answering.
     pending: Option<PendingCmd>,
     setup_done: bool,
+    /// The setup commands are all answered (see `setup_answered`).
+    setup_answered: bool,
     holds: u32,
+    /// The hold was released at least once in this process (see `release_hold`).
+    hold_released: bool,
     hold_release_at: Option<Instant>,
     connected: bool,
     next_reach_at: Option<Instant>,
@@ -492,7 +506,9 @@ impl Engine {
             queue: VecDeque::new(),
             pending: None,
             setup_done: false,
+            setup_answered: false,
             holds: 0,
+            hold_released: false,
             hold_release_at: None,
             connected: false,
             next_reach_at: None,
@@ -573,7 +589,9 @@ impl Engine {
         self.pending = None;
         self.progress_at = None;
         self.setup_done = false;
+        self.setup_answered = false;
         self.holds = 0;
+        self.hold_released = false;
         self.hold_release_at = None;
         self.connected = false;
         self.next_reach_at = None;
@@ -840,6 +858,7 @@ impl Engine {
 
     /// Let OpenVPN start the next try.
     fn release_hold(&mut self) {
+        self.hold_released = true;
         self.reset_try_state();
         self.progress_at = Some(Instant::now());
         self.send("hold release", Reply::Simple);
@@ -937,7 +956,13 @@ impl Engine {
         };
         let what = match self.last_state.as_str() {
             "" | "CONNECTING" => {
-                "OpenVPN did not start to connect, and no connection to the server was opened"
+                if self.hold_released {
+                    "OpenVPN did not start to connect after its hold was released, and no \
+                     connection to the server was opened"
+                } else {
+                    "OpenVPN was still waiting at its management hold, which was never \
+                     released, so no connection to the server was opened"
+                }
             }
             "RESOLVE" => "OpenVPN was still looking up the address of the server",
             "TCP_CONNECT" => "the server did not answer",
@@ -969,7 +994,22 @@ impl Engine {
         self.setup_done = true;
         self.send("log on all", Reply::LogHistory);
         self.send("state on all", Reply::StateHistory);
+        // The hold is released after this one is answered, so that OpenVPN
+        // is ready for the login when it comes (see `setup_answered`).
         self.send("bytecount 1", Reply::Simple);
+    }
+
+    /// The setup commands are all answered, so OpenVPN is done with them and
+    /// waits for the hold release - whether or not its `>HOLD` notice was
+    /// ever sent (see the module documentation).
+    fn setup_answered(&mut self) {
+        if self.setup_answered || !self.setup_done || self.holds > 0 || self.hold_released {
+            // The `>HOLD` notice arrived (or a hold is being waited out):
+            // that path releases the hold.
+            return;
+        }
+        self.setup_answered = true;
+        self.release_hold();
     }
 
     fn on_line(&mut self, raw: &str, mgmt_password: &Secret, process: &mut dyn VpnProcess) {
@@ -1012,6 +1052,7 @@ impl Engine {
                         self.pending = None;
                     }
                 }
+                self.setup_answered();
             }
             Line::End => {
                 if let Some(cmd) = self.pending.as_mut() {
@@ -1020,6 +1061,7 @@ impl Engine {
                         self.pending = None;
                     }
                 }
+                self.setup_answered();
             }
             Line::Data(d) => match self.pending.as_ref().map(|p| p.kind) {
                 Some(Reply::LogHistory) => {
@@ -1066,7 +1108,11 @@ impl Engine {
                     // OpenVPN is about to be stopped; do not start another try.
                 } else if self.holds == 1 && !self.connected_before_in_process() {
                     // First start of this process: any backoff already happened.
-                    self.release_hold();
+                    // The notice may come after the release that already happened
+                    // when the setup commands were answered.
+                    if !self.hold_released {
+                        self.release_hold();
+                    }
                 } else {
                     let delay = backoff(&self.opts.keepalive, self.attempt.max(1));
                     self.note(

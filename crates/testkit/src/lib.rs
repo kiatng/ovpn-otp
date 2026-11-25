@@ -71,6 +71,11 @@ pub struct Fake {
     /// A command that starts with this text gets no answer at all, as from an
     /// OpenVPN that is stuck.
     pub ignore: Arc<Mutex<Option<String>>>,
+    /// Do not send the `>HOLD` notice, as OpenVPN on Windows did in the 0.3.0
+    /// session: its output queue was thrown away by a command that arrived
+    /// while the notice was being written, and OpenVPN waited at the hold
+    /// without ever saying so.
+    pub skip_hold_notice: bool,
 }
 
 impl Fake {
@@ -84,6 +89,7 @@ impl Fake {
             mgmt_password: MGMT_PW.to_string(),
             windows_reentry: false,
             ignore: Arc::new(Mutex::new(None)),
+            skip_hold_notice: false,
         }
     }
 
@@ -120,6 +126,7 @@ impl Fake {
                     fake = fake.with_plan(&plan?);
                 }
                 "windows-reentry" => fake.windows_reentry = value.trim() == "1",
+                "skip-hold-notice" => fake.skip_hold_notice = value.trim() == "1",
                 other => return Err(format!("unknown key `{other}`")),
             }
         }
@@ -201,7 +208,9 @@ impl Fake {
         };
         conn.write("SUCCESS: password is correct");
         conn.write(">INFO:OpenVPN Management Interface Version 5 -- type 'help' for more info");
-        conn.write(">HOLD:Waiting for hold release:0");
+        if !self.skip_hold_notice {
+            conn.write(">HOLD:Waiting for hold release:0");
+        }
         if !early.is_empty() {
             conn.take(&early);
         }
