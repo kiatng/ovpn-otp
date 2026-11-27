@@ -524,6 +524,16 @@ impl Engine {
     }
 
     fn emit(&self, ev: Event) {
+        #[cfg(feature = "diagnostic-test")]
+        let ev = {
+            let mut ev = ev;
+            redact_test_event(
+                &mut ev,
+                self.opts.login.password.expose(),
+                self.opts.code_digits,
+            );
+            ev
+        };
         let _ = self.events.send(ev);
     }
 
@@ -1483,6 +1493,77 @@ fn spawn_reader(stream: TcpStream, gen: u64, tx: Sender<Input>) {
         }
         let _ = tx.send(Input::Mgmt(gen, None));
     });
+}
+
+// The separate diagnostic build must not persist credentials, even if an
+// unexpected OpenVPN message echoes them. Mask digit runs long enough to hold
+// a code as well, because a code can have been discarded before a log arrives.
+#[cfg(feature = "diagnostic-test")]
+fn redact_test_text(text: &mut String, password: &str, digits: u8) {
+    if !password.is_empty() {
+        *text = text.replace(password, "********");
+    }
+    let mut output = String::new();
+    let mut run = String::new();
+    let flush = |output: &mut String, run: &mut String| {
+        if run.len() >= usize::from(digits).max(1) {
+            output.push_str("********");
+        } else {
+            output.push_str(run);
+        }
+        run.clear();
+    };
+    for c in text.chars() {
+        if c.is_ascii_digit() {
+            run.push(c);
+        } else {
+            flush(&mut output, &mut run);
+            output.push(c);
+        }
+    }
+    flush(&mut output, &mut run);
+    *text = output;
+}
+
+#[cfg(feature = "diagnostic-test")]
+fn redact_test_event(event: &mut Event, password: &str, digits: u8) {
+    let clean = |s: &mut String| redact_test_text(s, password, digits);
+    match event {
+        Event::Wire { text, .. } | Event::Note { text, .. } => clean(text),
+        Event::Log(entry) => clean(&mut entry.message),
+        Event::State { info, .. } => {
+            clean(&mut info.detail);
+            clean(&mut info.local_ip);
+            clean(&mut info.remote_ip);
+            clean(&mut info.remote_port);
+        }
+        Event::AuthFailed { reason } | Event::Reconnecting { reason, .. } => clean(reason),
+        Event::ConnectFailed { failure, .. } => clean(&mut failure.message),
+        Event::Ended { reason } => match reason {
+            EndReason::Dropped(s) => clean(s),
+            EndReason::Failed(f) => clean(&mut f.message),
+            EndReason::Disconnected => {}
+        },
+        Event::Version(s) => clean(s),
+        Event::Pushed(p) => {
+            for s in &mut p.routes {
+                clean(s);
+            }
+            for s in &mut p.dns {
+                clean(s);
+            }
+            if let Some(s) = &mut p.ifconfig {
+                clean(s);
+            }
+        }
+        Event::Reach(r) => {
+            clean(&mut r.target);
+            if let Some(s) = &mut r.error {
+                clean(s);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Hide secrets in a command before showing it.

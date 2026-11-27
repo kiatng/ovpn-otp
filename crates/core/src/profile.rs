@@ -418,7 +418,9 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
                     keep(&mut out);
                 }
             }
-            o if DROPPED.contains(&o) => {
+            o if DROPPED.contains(&o)
+                || (cfg!(feature = "diagnostic-test") && ["log", "log-append"].contains(&o)) =>
+            {
                 out.push_str("# removed by ovpn-otp: ");
                 out.push_str(trimmed);
                 out.push('\n');

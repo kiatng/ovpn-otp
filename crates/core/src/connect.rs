@@ -102,7 +102,11 @@ pub fn prepare(
         servers: prepared.server_labels(),
         ..describe(loaded, &login.username)
     };
-    let verb = effective_verb(settings, &prepared);
+    let verb = if cfg!(feature = "diagnostic-test") {
+        6
+    } else {
+        effective_verb(settings, &prepared)
+    };
     let config_path = session::prepared_config_path(&runtime.path, &settings.name);
     crate::launch::write_private(&config_path, prepared.text.as_bytes()).map_err(|e| {
         ConnectError::Prepare {
