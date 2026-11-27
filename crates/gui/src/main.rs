@@ -163,6 +163,10 @@ fn tone_color(tone: Tone) -> Color32 {
 }
 
 struct App {
+    update_rx:
+        Option<std::sync::mpsc::Receiver<Result<Option<ovpn_otp_core::update::Release>, String>>>,
+    update_available: Option<ovpn_otp_core::update::Release>,
+    update_installing: bool,
     loaded: LoadedSettings,
     load_error: Option<String>,
     username: String,
@@ -211,6 +215,9 @@ impl App {
         };
         let shot = shot::Shot::from_env();
         let mut app = App {
+            update_rx: None,
+            update_available: None,
+            update_installing: false,
             edit: loaded.settings.clone(),
             prefix_text: String::new(),
             extra_text: String::new(),
@@ -239,6 +246,11 @@ impl App {
             connect_at_start: shot.as_ref().is_some_and(|s| s.connects()),
             shot,
         };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(ovpn_otp_core::update::check());
+        });
+        app.update_rx = Some(rx);
         app.reset_edit();
         app.load_login();
         if let Some((username, password, code)) = app.shot.as_ref().and_then(|s| s.login()) {
@@ -310,6 +322,9 @@ impl App {
     }
 
     fn connect(&mut self) {
+        if self.update_installing {
+            return;
+        }
         self.message = None;
         let code = match validate_code(&self.code, self.digits()) {
             Ok(c) => c,
@@ -628,19 +643,31 @@ impl App {
                 }
 
                 ui.label(RichText::new("Profile").weak());
-                if using.profile.is_empty() {
-                    ui.label(RichText::new("none yet: choose one under Settings").color(AMBER));
-                } else {
-                    // About 7.5 points for each letter of the monospace font.
-                    let fits = (ui.available_width() / 7.5) as usize;
-                    ui.add(
-                        egui::Label::new(
-                            RichText::new(end_of_path(&using.profile, fits)).monospace(),
-                        )
-                        .truncate(),
+                ui.horizontal(|ui| {
+                    let label = if using.profile.is_empty() {
+                        "none yet"
+                    } else {
+                        &using.profile
+                    };
+                    let width = (ui.available_width() - 65.0).max(20.0);
+                    let shortened = end_of_path(label, (width / 7.5) as usize);
+                    ui.add_sized(
+                        [width, ui.spacing().interact_size.y],
+                        egui::Label::new(RichText::new(shortened).monospace()).truncate(),
                     )
-                    .on_hover_text(&using.profile);
-                }
+                    .on_hover_text(label);
+                    if ui
+                        .add_enabled(!active, egui::Button::new("Change").small())
+                        .clicked()
+                    {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("OpenVPN profile", &["ovpn"])
+                            .pick_file()
+                        {
+                            self.change_profile(path);
+                        }
+                    }
+                });
                 ui.end_row();
 
                 ui.label(RichText::new("User").weak());
@@ -753,12 +780,64 @@ impl App {
     /// Everything that is always shown. Gives back how tall it is, measured
     /// from the top of the window, also when the window is too small for it.
     fn main_view(&mut self, ui: &mut egui::Ui) -> f32 {
+        egui::MenuBar::new().ui(ui, |ui| {
+            ui.menu_button("View", |ui| {
+                for section in Section::ALL {
+                    if ui
+                        .selectable_label(self.section == Some(section), section.label())
+                        .clicked()
+                    {
+                        self.section = if self.section == Some(section) {
+                            None
+                        } else {
+                            Some(section)
+                        };
+                        self.asked_height = None;
+                        ui.close();
+                    }
+                }
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(
+                    RichText::new(format!("ovpn-otp {}", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
+            });
+        });
+        ui.separator();
         ui.add_space(6.0);
         self.banner(ui);
         ui.add_space(6.0);
         self.using_rows(ui);
         ui.add_space(6.0);
         self.code_row(ui);
+        if let Some(release) = self.update_available.clone() {
+            ui.horizontal(|ui| {
+                ui.label(format!("Version {} is available.", release.version));
+                let active = self.is_active();
+                if ui
+                    .add_enabled(
+                        !active && !self.update_installing,
+                        egui::Button::new("Update and restart"),
+                    )
+                    .clicked()
+                {
+                    self.update_installing = true;
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    self.update_rx = Some(rx);
+                    std::thread::spawn(move || {
+                        let _ = tx.send(ovpn_otp_core::update::install(&release).map(|_| None));
+                    });
+                }
+                if active {
+                    ui.label("Disconnect to update.");
+                }
+                if self.update_installing {
+                    ui.label("Updating…");
+                }
+            });
+        }
         if let Some((is_err, msg)) = &self.message {
             let color = if *is_err {
                 RED
@@ -770,24 +849,6 @@ impl App {
         if let Some(e) = &self.load_error {
             ui.label(RichText::new(e).color(RED));
         }
-        ui.add_space(2.0);
-        ui.separator();
-        ui.horizontal(|ui| {
-            for section in Section::ALL {
-                let open = self.section == Some(section);
-                if ui.selectable_label(open, section.label()).clicked() {
-                    self.section = if open { None } else { Some(section) };
-                    self.asked_height = None;
-                }
-            }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    RichText::new(format!("ovpn-otp {}", env!("CARGO_PKG_VERSION")))
-                        .small()
-                        .weak(),
-                );
-            });
-        });
         ui.add_space(4.0);
         ui.min_rect().bottom() + 2.0
     }
@@ -1134,6 +1195,28 @@ impl App {
         });
     }
 
+    fn change_profile(&mut self, path: PathBuf) {
+        if self.load_error.is_some() {
+            self.message = Some((
+                true,
+                "Fix the settings file before changing the profile.".into(),
+            ));
+            return;
+        }
+        let mut settings = self.loaded.settings.clone();
+        settings.profile.path = path.display().to_string();
+        match settings::save(&self.loaded.path, &settings) {
+            Ok(()) => {
+                self.loaded.settings = settings;
+                self.edit.profile.path = self.loaded.settings.profile.path.clone();
+                self.load_error = None;
+                self.refresh_using();
+                self.message = Some((false, "Profile saved.".into()));
+            }
+            Err(e) => self.message = Some((true, format!("Could not save profile: {e}"))),
+        }
+    }
+
     fn save_settings(&mut self) {
         let mut s = self.edit.clone();
         if !cfg!(windows) {
@@ -1201,6 +1284,33 @@ impl eframe::App for App {
             self.connect();
         }
         self.pump(ctx);
+        if let Some(result) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
+            self.update_rx = None;
+            if self.update_installing {
+                self.update_installing = false;
+                match result {
+                    Ok(_) => {
+                        match std::env::current_exe().and_then(|exe| {
+                            std::process::Command::new(exe)
+                                .args(std::env::args_os().skip(1))
+                                .spawn()
+                        }) {
+                            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            Err(e) => {
+                                self.message =
+                                    Some((true, format!("Updated, but could not restart: {e}")))
+                            }
+                        }
+                    }
+                    Err(e) => self.message = Some((true, format!("Update failed: {e}"))),
+                }
+            } else if let Ok(release) = result {
+                self.update_available = release;
+            }
+        }
+        if self.update_rx.is_some() {
+            ctx.request_repaint_after(Duration::from_millis(500));
+        }
         if let Some(shot) = self.shot.as_mut() {
             shot.tick(ctx);
         }

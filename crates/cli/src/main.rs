@@ -54,6 +54,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Install the latest verified release.
+    Update,
     /// Connect and stay connected until Ctrl+C or `ovpn-otp disconnect`.
     Connect(ConnectArgs),
     /// Give the authenticator code to a session that is waiting for one.
@@ -350,6 +352,17 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     let path = settings::settings_path(cli.config.as_deref());
     match cli.command {
+        Cmd::Update => {
+            match ovpn_otp_core::update::check().map_err(anyhow::Error::msg)? {
+                Some(release) => {
+                    println!("Installing version {}...", release.version);
+                    ovpn_otp_core::update::install(&release).map_err(anyhow::Error::msg)?;
+                    println!("Updated to version {}.", release.version);
+                }
+                None => println!("Already up to date."),
+            }
+            Ok(exit_code::OK)
+        }
         Cmd::Connect(args) => connect_cmd::cmd_connect(&path, args),
         Cmd::Code { code, stdin } => control::cmd_code(&path, code, stdin),
         Cmd::Wait {

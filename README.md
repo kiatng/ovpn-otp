@@ -63,12 +63,18 @@ Because the real work is done by OpenVPN, your connection is exactly as secure a
 
 To build from source instead, install Rust and run `cargo build --release`; the programs land in `target/release/`.
 
+## Updates
+
+Starting with version 0.4.0, the window checks for a newer release in the background. If one is available, disconnect and click **Update and restart**. You can also run `ovpn-otp update` in a terminal. The programs must be in a folder you can write to.
+
+The update downloads the release for your operating system and checks the archive against the published SHA-256 file before replacing the programs. If you are offline, the window continues to work without an update notice. Versions before 0.4.0 cannot update themselves; download and unpack the new release once from the [releases page](https://github.com/kiatng/ovpn-otp/releases).
+
 ## First connect
 
 You need your VPN profile, a `.ovpn` file. On a Sophos Firewall you download it from the user portal, in the SSL VPN section; other servers have a similar download. If you already imported it into another client, download it again, because ovpn-otp needs the file itself.
 
 1. Put the profile somewhere you like, for example next to your settings file.
-2. Start `ovpn-otp-gui`. It opens with **Settings** open because there is no profile yet. Enter the path to the `.ovpn` file in **Profile (.ovpn)** and click **Save settings**. The **Server** and **Profile** rows at the top now show what you will connect to.
+2. Start `ovpn-otp-gui`. It opens with **Settings** open because there is no profile yet. Click **Change** beside **Profile** and choose the `.ovpn` file. The **Server** and **Profile** rows at the top now show what you will connect to.
 3. Enter your user name and password in the **User** and **Password** rows. Leave **Remember** ticked to keep them in the credential store.
 4. Open your authenticator app, type the 6-digit code into the code box, and press Enter or click **Connect**.
 
@@ -111,7 +117,7 @@ The window is small on purpose: about 420 by 290 points, and only as tall as wha
 
 **What do I do next?** The code box and one button: **Connect**, or **Disconnect** while a session runs. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server. With a saved login the **User** row shows only your user name, with **Change** next to it; the password box comes back when you click that.
 
-Everything else is one click away, on the line at the bottom. A click opens the part and makes the window taller; a second click closes it again.
+Open the **View** menu at the top to show Details, Log, Wire or Settings. Choose an open part again to close it.
 
 | Part | What it shows |
 | --- | --- |
@@ -467,7 +473,7 @@ Start with `ovpn-otp doctor`, which checks each piece in turn. Then open **Log**
 | "sudo wants a password" (Linux) | Follow [Linux: let openvpn create the tunnel](#linux-let-openvpn-create-the-tunnel). |
 | "Cannot open TUN" or "Operation not permitted" | OpenVPN has no network rights; see the same section. |
 | "Login rejected", or "The server rejected the login" | Check the code first: wait for a new code in your app and try again. If it keeps failing, re-enter your password (tick **Show** to check it) and save it again. |
-| "The server ... closed the connection during login and gave no reason" | The secure channel was set up, then the server hung up without an answer. Some firewalls do this instead of saying what is wrong. Wait for the next code and try once more, because a code works only once. Then check the password. If it still fails, the cause may be the cipher: look for "cipher" in `ovpn-otp logs`, and see [What ovpn-otp changes in your profile](#what-ovpn-otp-changes-in-your-profile). |
+| "The server ... closed the connection during login and gave no reason" | The server hung up without explaining why; the TLS handshake may not have finished. Some firewalls do this instead of saying what is wrong. Wait for the next code and try once more, because a code works only once. Then check the password. If it still fails, the cause may be the cipher: look for "cipher" in `ovpn-otp logs`, and see [What ovpn-otp changes in your profile](#what-ovpn-otp-changes-in-your-profile). |
 | "The server ... and OpenVPN have no encryption cipher in common" | The server uses a cipher that OpenVPN did not offer. Add it with `extra_options`, for example `"data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC"`, with the cipher your VPN administrator names in place of the last one. |
 | "Could not reach the VPN server" | Check your network connection, then the server address and port in the profile (`ovpn-otp profile show`). The message includes what OpenVPN said, such as "Connection timed out". |
 | "Gave up connecting ... without progress" | The connect stood still for `connect.timeout` seconds, and the message names the step it stood at: still waiting at the management hold (OpenVPN never got going), "The server did not answer" (the network or the server address), and so on. The whole message is also in `ovpn-otp logs`. For a slow server, give it more time with `ovpn-otp config set connect.timeout 120`. |
@@ -534,7 +540,7 @@ The integration test builds a throwaway certificate authority, starts an OpenVPN
 
 Two more servers in that test play the failures that are hard to see otherwise. The first accepts only the cipher AES-128-CBC, as older firewalls do. The test first shows that plain OpenVPN with a profile that says `cipher AES-128-CBC` is refused by it right after the TLS handshake, and then that ovpn-otp connects with the same profile. The second server closes the connection in the middle of the login without an answer, and the test checks that ovpn-otp ends with `server_reset` and exit code 4 instead of asking for another code.
 
-Not done yet, and welcome as contributions: macOS support, a tray icon, and automatic updates.
+Not done yet, and welcome as contributions: macOS support and a tray icon.
 
 ## License
 
