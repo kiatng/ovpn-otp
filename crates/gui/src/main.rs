@@ -590,12 +590,12 @@ impl App {
                     ui.label(RichText::new(&headline.title).size(18.0).strong());
                 });
                 if !headline.detail.is_empty() {
-                    // A long reason is cut here; all of it is under Details.
+                    // A long reason is cut here; the full message is in Log.
                     let short: String = headline.detail.chars().take(170).collect();
                     let cut = short.len() < headline.detail.len();
                     ui.add(
                         egui::Label::new(if cut {
-                            format!("{short}… (more under Details)")
+                            format!("{short}… (more under Log)")
                         } else {
                             short
                         })
@@ -919,10 +919,6 @@ impl App {
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| {
-                if let (Some(e), false) = (&s.last_error, s.phase == Phase::Connected) {
-                    ui.label(RichText::new(e).color(RED));
-                    ui.add_space(4.0);
-                }
                 let dash = |v: &str| {
                     if v.is_empty() {
                         "-".to_string()
@@ -939,20 +935,6 @@ impl App {
                             ui.monospace(value);
                             ui.end_row();
                         };
-                        row(
-                            ui,
-                            "OpenVPN says",
-                            dash(format!("{} {}", s.state, s.state_detail).trim()),
-                        );
-                        row(ui, "Server in use", dash(&s.server));
-                        row(ui, "Tunnel address", dash(&s.local_ip));
-                        row(
-                            ui,
-                            "Connected for",
-                            s.connected_since
-                                .map(|t| format_duration((now - t).num_seconds()))
-                                .unwrap_or_else(|| "-".into()),
-                        );
                         row(
                             ui,
                             "Received",
@@ -1009,23 +991,7 @@ impl App {
                                     .join(" "),
                             ),
                         );
-                        row(ui, "Settings file", self.using.settings.clone());
                     });
-                ui.add_space(6.0);
-                ui.label(RichText::new("Steps").strong());
-                if s.timeline.is_empty() {
-                    ui.label(
-                        RichText::new("Each step of a connect shows up here with its time.").weak(),
-                    );
-                }
-                egui::Grid::new("timeline").striped(true).show(ui, |ui| {
-                    for t in &s.timeline {
-                        ui.monospace(t.at.format("%H:%M:%S").to_string());
-                        ui.monospace(RichText::new(&t.state).strong());
-                        ui.label(&t.detail);
-                        ui.end_row();
-                    }
-                });
             });
     }
 
@@ -1081,8 +1047,7 @@ impl App {
     fn wire_section(&self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(
-                "Every line between this app and OpenVPN. Passwords, codes and session \
-                 tokens show as ********.",
+                "Every message between this app and the VPN connection. Passwords and codes are hidden.",
             )
             .small()
             .weak(),
@@ -1131,8 +1096,9 @@ impl App {
                     .on_hover_text("The saved login is stored under this name.");
                 ui.end_row();
                 ui.label("Profile (.ovpn)");
-                ui.text_edit_singleline(&mut e.profile.path)
-                    .on_hover_text("A relative path is relative to the settings file.");
+                let profile = end_of_path(&e.profile.path, (ui.available_width() / 7.5) as usize);
+                ui.add(egui::Label::new(profile).truncate())
+                    .on_hover_text(format!("{}\nChoose a different profile on Connect.", e.profile.path));
                 ui.end_row();
                 ui.label("Use another server");
                 ui.add(egui::TextEdit::singleline(&mut e.profile.remote).hint_text("host:port, empty = use the profile"));

@@ -65,9 +65,9 @@ To build from source instead, install Rust and run `cargo build --release`; the 
 
 ## Updates
 
-Starting with version 0.4.0, the window checks for a newer release in the background. If one is available, disconnect and click **Update and restart**. You can also run `ovpn-otp update` in a terminal. The programs must be in a folder you can write to.
+Starting with version 0.4.1, the window checks for a newer release in the background. If one is available, disconnect and click **Update and restart**. You can also run `ovpn-otp update` in a terminal. The programs must be in a folder you can write to.
 
-The update downloads the release for your operating system and checks the archive against the published SHA-256 file before replacing the programs. If you are offline, the window continues to work without an update notice. Versions before 0.4.0 cannot update themselves; download and unpack the new release once from the [releases page](https://github.com/kiatng/ovpn-otp/releases).
+The update downloads the release for your operating system and checks the archive against the published SHA-256 file before replacing the programs. If you are offline, the window continues to work without an update notice. Versions before 0.4.1 cannot update themselves; download and unpack the new release once from the [releases page](https://github.com/kiatng/ovpn-otp/releases).
 
 ## First connect
 
@@ -121,7 +121,7 @@ Choose **Details**, **Log**, **Wire** or **Settings** at the top to open that vi
 
 | Part | What it shows |
 | --- | --- |
-| Details | The state OpenVPN itself reports, the server in use, your tunnel address, how long the connection has been up, bytes received and sent with the speed, how long ago data last arrived (a number that keeps growing means the link has gone quiet), the reach check, routes and DNS, and every step of the connection with the time it happened. The full reason for a failure is here too. |
+| Details | Bytes received and sent with the speed, how long ago data last arrived (a number that keeps growing means the link has gone quiet), the reach check, routes, DNS and OpenVPN version. |
 | Log | The OpenVPN log and messages from ovpn-otp, with a filter for warnings and errors. |
 | Wire | Every line exchanged with OpenVPN on the management interface. Passwords, codes and session tokens show as `********`. |
 | Settings | The settings for this machine, and **Copy diagnostics**, which puts a troubleshooting report on the clipboard: versions, status, settings, timeline, log and wire transcript. Your password never appears in it, and your user name is replaced with `<user>`. |

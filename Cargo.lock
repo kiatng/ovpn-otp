@@ -2880,7 +2880,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-otp"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2895,7 +2895,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-otp-core"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "base64 0.22.1",
  "chrono",
@@ -2918,7 +2918,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-otp-gui"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "chrono",
  "eframe",
@@ -2929,7 +2929,7 @@ dependencies = [
 
 [[package]]
 name = "ovpn-otp-testkit"
-version = "0.4.0"
+version = "0.4.1"
 
 [[package]]
 name = "parking"
