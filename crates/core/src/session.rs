@@ -421,6 +421,8 @@ struct Engine {
     // State of the current try, reset when the hold is released.
     /// The server answered (OpenVPN reached `AUTH`), so the login may have been sent to it.
     reached_auth: bool,
+    /// Whether OpenVPN reported that the TLS control channel is established.
+    tls_established: bool,
     /// The code handed to OpenVPN for this try, kept until it is known whether
     /// it left this machine. A code the server never saw can be used again.
     sent_code: Option<(String, Instant)>,
@@ -494,6 +496,7 @@ impl Engine {
             ever_connected: false,
             unreachable_tries: 0,
             reached_auth: false,
+            tls_established: false,
             sent_code: None,
             cipher_error: None,
             auth_reason: None,
@@ -618,6 +621,7 @@ impl Engine {
     /// Forget what the last try found out, before the next one starts.
     fn reset_try_state(&mut self) {
         self.reached_auth = false;
+        self.tls_established = false;
         self.cipher_error = None;
         self.auth_reason = None;
         self.last_problem = None;
@@ -1091,6 +1095,11 @@ impl Engine {
     }
 
     fn on_log(&mut self, entry: LogEntry) {
+        if entry.message.starts_with("Control Channel: TLS")
+            || entry.message.contains("Peer Connection Initiated with")
+        {
+            self.tls_established = true;
+        }
         if let Some(reply) = mgmt::parse_push_reply(&entry.message) {
             self.emit(Event::Pushed(reply));
         }
@@ -1159,6 +1168,12 @@ impl Engine {
 
     fn on_state(&mut self, info: StateInfo) {
         self.last_state = info.name.clone();
+        if matches!(
+            info.name.as_str(),
+            "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" | "CONNECTED"
+        ) {
+            self.tls_established = true;
+        }
         match info.name.as_str() {
             "AUTH" | "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => {
                 // The server answered, and the login goes to it now: the code
@@ -1325,6 +1340,18 @@ impl Engine {
                 format!(
                     "Could not reach the VPN server{at_server}.{problem} Check the network \
                      connection, and the server address and port in the profile."
+                ),
+            );
+        }
+        if detail == "connection-reset" && !self.tls_established {
+            return Failure::new(
+                FailureKind::ServerReset,
+                format!(
+                    "The server{at_server} closed the connection during login before OpenVPN \
+                     reported that the secure channel was established. If your VPN provider \
+                     gives each user a profile, select the profile downloaded for this user. \
+                     If it still fails, ask your VPN administrator to check the client \
+                     certificate and server logs."
                 ),
             );
         }

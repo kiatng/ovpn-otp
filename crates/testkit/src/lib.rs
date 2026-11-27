@@ -27,6 +27,8 @@ pub enum Outcome {
     /// The secure channel is set up, then the server closes the connection
     /// without a reason, as some firewalls do.
     Reset,
+    /// The server closes the connection during the TLS handshake.
+    ResetDuringTls,
     /// No server answers.
     Unreachable,
     /// The server refuses because it shares no data cipher with the client.
@@ -115,6 +117,7 @@ impl Fake {
                         .map(|o| match o.trim() {
                             "login" => Ok(Outcome::Login),
                             "reset" => Ok(Outcome::Reset),
+                            "reset-tls" => Ok(Outcome::ResetDuringTls),
                             "unreachable" => Ok(Outcome::Unreachable),
                             "no-shared-cipher" => Ok(Outcome::NoSharedCipher),
                             "hang" => Ok(Outcome::Hang),
@@ -485,7 +488,12 @@ impl Conn<'_> {
             Outcome::Unreachable | Outcome::Hang => unreachable!("handled above"),
             Outcome::HangInAuth => {}
             Outcome::HangInConfig => self.emit_state("GET_CONFIG", ",,,,,"),
-            Outcome::Reset => {
+            Outcome::Reset | Outcome::ResetDuringTls => {
+                if outcome == Outcome::Reset {
+                    self.emit(
+                        ">LOG:1700000002,I,Control Channel: TLSv1.3, cipher TLS_AES_256_GCM_SHA384",
+                    );
+                }
                 self.emit(">LOG:1700000002,N,Connection reset, restarting [0]");
                 self.emit(
                     ">LOG:1700000002,I,SIGUSR1[soft,connection-reset] received, process restarting",

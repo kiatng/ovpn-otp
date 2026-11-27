@@ -463,6 +463,20 @@ fn snapshot_of(seen: &[Event]) -> Snapshot {
     snap
 }
 
+/// A TLS reset should point to the client profile, not a rejected code.
+#[test]
+fn reset_before_tls_completion_suggests_checking_the_profile() {
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::ResetDuringTls]);
+    let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert_eq!(failure.kind, FailureKind::ServerReset);
+    assert!(failure.message.contains("before OpenVPN reported"));
+    assert!(failure.message.contains("profile downloaded for this user"));
+    assert!(!failure.message.contains("code was wrong"));
+    assert_eq!(need_code_count(&seen), 0);
+}
+
 /// The failure this was first reported with: the secure channel is set up,
 /// then the server closes the connection in the same second and says nothing.
 #[test]

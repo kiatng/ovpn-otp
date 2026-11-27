@@ -117,7 +117,7 @@ The window is small on purpose: about 420 by 290 points, and only as tall as wha
 
 **What do I do next?** The code box and one button: **Connect**, or **Disconnect** while a session runs. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server. With a saved login the **User** row shows only your user name, with **Change** next to it; the password box comes back when you click that.
 
-Open the **View** menu at the top to show Details, Log, Wire or Settings. Choose an open part again to close it.
+Choose **Details**, **Log**, **Wire** or **Settings** at the top to open it. Choose it again to close it.
 
 | Part | What it shows |
 | --- | --- |
@@ -473,7 +473,7 @@ Start with `ovpn-otp doctor`, which checks each piece in turn. Then open **Log**
 | "sudo wants a password" (Linux) | Follow [Linux: let openvpn create the tunnel](#linux-let-openvpn-create-the-tunnel). |
 | "Cannot open TUN" or "Operation not permitted" | OpenVPN has no network rights; see the same section. |
 | "Login rejected", or "The server rejected the login" | Check the code first: wait for a new code in your app and try again. If it keeps failing, re-enter your password (tick **Show** to check it) and save it again. |
-| "The server ... closed the connection during login and gave no reason" | The server hung up without explaining why; the TLS handshake may not have finished. Some firewalls do this instead of saying what is wrong. Wait for the next code and try once more, because a code works only once. Then check the password. If it still fails, the cause may be the cipher: look for "cipher" in `ovpn-otp logs`, and see [What ovpn-otp changes in your profile](#what-ovpn-otp-changes-in-your-profile). |
+| "The server ... closed the connection during login and gave no reason" | The server hung up without explaining why. If OpenVPN did not report a completed secure channel, check that you selected the profile downloaded for this user and ask your VPN administrator to check the client certificate and server logs. If the secure channel was established, wait for the next code and check the password; the logs may also point to a cipher mismatch. |
 | "The server ... and OpenVPN have no encryption cipher in common" | The server uses a cipher that OpenVPN did not offer. Add it with `extra_options`, for example `"data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC"`, with the cipher your VPN administrator names in place of the last one. |
 | "Could not reach the VPN server" | Check your network connection, then the server address and port in the profile (`ovpn-otp profile show`). The message includes what OpenVPN said, such as "Connection timed out". |
 | "Gave up connecting ... without progress" | The connect stood still for `connect.timeout` seconds, and the message names the step it stood at: still waiting at the management hold (OpenVPN never got going), "The server did not answer" (the network or the server address), and so on. The whole message is also in `ovpn-otp logs`. For a slow server, give it more time with `ovpn-otp config set connect.timeout 120`. |

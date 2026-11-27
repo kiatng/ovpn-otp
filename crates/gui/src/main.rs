@@ -781,22 +781,19 @@ impl App {
     /// from the top of the window, also when the window is too small for it.
     fn main_view(&mut self, ui: &mut egui::Ui) -> f32 {
         egui::MenuBar::new().ui(ui, |ui| {
-            ui.menu_button("View", |ui| {
-                for section in Section::ALL {
-                    if ui
-                        .selectable_label(self.section == Some(section), section.label())
-                        .clicked()
-                    {
-                        self.section = if self.section == Some(section) {
-                            None
-                        } else {
-                            Some(section)
-                        };
-                        self.asked_height = None;
-                        ui.close();
-                    }
+            for section in Section::ALL {
+                if ui
+                    .selectable_label(self.section == Some(section), section.label())
+                    .clicked()
+                {
+                    self.section = if self.section == Some(section) {
+                        None
+                    } else {
+                        Some(section)
+                    };
+                    self.asked_height = None;
                 }
-            });
+            }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     RichText::new(format!("ovpn-otp {}", env!("CARGO_PKG_VERSION")))
