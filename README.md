@@ -65,9 +65,9 @@ To build from source instead, install Rust and run `cargo build --release`; the 
 
 ## Updates
 
-Starting with version 0.4.1, the window checks for a newer release in the background. If one is available, disconnect and click **Update and restart**. You can also run `ovpn-otp update` in a terminal. The programs must be in a folder you can write to.
+Starting with version 0.4.2, the window checks for a newer release in the background. If one is available, disconnect and click **Update and restart**. You can also run `ovpn-otp update` in a terminal. The programs must be in a folder you can write to.
 
-The update downloads the release for your operating system and checks the archive against the published SHA-256 file before replacing the programs. If you are offline, the window continues to work without an update notice. Versions before 0.4.1 cannot update themselves; download and unpack the new release once from the [releases page](https://github.com/kiatng/ovpn-otp/releases).
+The update downloads the release for your operating system and checks the archive against the published SHA-256 file before replacing the programs. If you are offline, the window continues to work without an update notice. Versions before 0.4.2 cannot update themselves; download and unpack the new release once from the [releases page](https://github.com/kiatng/ovpn-otp/releases).
 
 ## First connect
 
