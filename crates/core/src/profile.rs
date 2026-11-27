@@ -542,6 +542,20 @@ remote inside-a-block-is-not-an-option
 </ca>
 ";
 
+    #[cfg(feature = "diagnostic-test")]
+    #[test]
+    fn diagnostic_profile_drops_unfiltered_log_destinations() {
+        let mut settings = Settings::default();
+        settings.openvpn.extra_options =
+            vec!["log-append extra.log".into(), "syslog openvpn".into()];
+        let output = prepare("client\nlog private.log\n", &settings)
+            .unwrap()
+            .text;
+        assert!(!output.lines().any(|line| line.starts_with("log ")
+            || line.starts_with("log-append ")
+            || line.starts_with("syslog ")));
+    }
+
     /// Shaped like a firewall export: a public server, then the same server
     /// by its address inside the office network.
     const TWO_REMOTES: &str = "client
