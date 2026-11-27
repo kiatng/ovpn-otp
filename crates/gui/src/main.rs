@@ -1,10 +1,8 @@
 //! `ovpn-otp-gui`: the desktop window.
 //!
-//! One small window. Always on top of it: a coloured banner with the state
-//! in words, what is in use (connection, server, profile and user name), the
-//! code box, and Connect or Disconnect. Below that, closed until you ask for
-//! them: Details, Log, Wire and Settings. The window is only as tall as what
-//! it shows, and grows when you open one of the four.
+//! One small window with a menu for Connect, Details, Log, Wire and Settings.
+//! Connect shows the current connection, the code box and Connect or Disconnect.
+//! Each other menu item shows its own view in the window.
 //!
 //! The window also shows a session that `ovpn-otp connect` started in a
 //! terminal, and can give it a code or stop it.
@@ -98,7 +96,7 @@ fn main() -> eframe::Result {
     )
 }
 
-/// What can be opened below the main view.
+/// A view other than Connect, selected from the top menu.
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Section {
     Details,
@@ -277,11 +275,6 @@ impl App {
             app.code = code;
         }
         app.refresh_using();
-        if app.section.is_none() && (app.load_error.is_some() || app.loaded.profile_text().is_err())
-        {
-            // Nothing can be connected to yet: show where the profile is set.
-            app.section = Some(Section::Settings);
-        }
         app
     }
 
@@ -661,31 +654,42 @@ impl App {
                 }
 
                 ui.label(RichText::new("Profile").weak());
-                ui.horizontal(|ui| {
-                    let label = if using.profile.is_empty() {
-                        "none yet"
-                    } else {
-                        &using.profile
-                    };
-                    let width = (ui.available_width() - 65.0).max(20.0);
-                    let shortened = end_of_path(label, (width / 7.5) as usize);
-                    ui.add_sized(
-                        [width, ui.spacing().interact_size.y],
-                        egui::Label::new(RichText::new(shortened).monospace()).truncate(),
+                let label = if using.profile.is_empty() {
+                    "Choose a profile"
+                } else {
+                    &using.profile
+                };
+                let shortened = end_of_path(label, (ui.available_width() / 7.5) as usize);
+                let text = RichText::new(shortened).monospace();
+                let text = if active { text } else { text.underline() };
+                let response = ui
+                    .add_enabled(
+                        !active,
+                        egui::Label::new(text)
+                            .truncate()
+                            .sense(egui::Sense::click()),
                     )
                     .on_hover_text(label);
-                    if ui
-                        .add_enabled(!active, egui::Button::new("Change").small())
-                        .clicked()
+                let response = if active {
+                    response
+                } else {
+                    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                };
+                if response.clicked() {
+                    let mut dialog =
+                        rfd::FileDialog::new().add_filter("OpenVPN profile", &["ovpn"]);
+                    if let Some(dir) = self
+                        .loaded
+                        .profile_path()
+                        .and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+                        .filter(|p| p.is_dir())
                     {
-                        if let Some(path) = rfd::FileDialog::new()
-                            .add_filter("OpenVPN profile", &["ovpn"])
-                            .pick_file()
-                        {
-                            self.change_profile(path);
-                        }
+                        dialog = dialog.set_directory(dir);
                     }
-                });
+                    if let Some(path) = dialog.pick_file() {
+                        self.change_profile(path);
+                    }
+                }
                 ui.end_row();
 
                 ui.label(RichText::new("User").weak());
@@ -701,12 +705,24 @@ impl App {
                         self.using.username = self.username.trim().to_string();
                     }
                 } else {
-                    ui.horizontal(|ui| {
-                        value(ui, &using.username);
-                        if !active && ui.small_button("Change").clicked() {
-                            self.edit_login = true;
-                        }
-                    });
+                    let text = RichText::new(&using.username).monospace();
+                    let text = if active { text } else { text.underline() };
+                    let response = ui
+                        .add_enabled(
+                            !active,
+                            egui::Label::new(text)
+                                .truncate()
+                                .sense(egui::Sense::click()),
+                        )
+                        .on_hover_text(&using.username);
+                    let response = if active {
+                        response
+                    } else {
+                        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+                    };
+                    if response.clicked() {
+                        self.edit_login = true;
+                    }
                 }
                 ui.end_row();
 
@@ -754,6 +770,7 @@ impl App {
         let can_type = !active || waiting;
         let mut enter = false;
         ui.horizontal(|ui| {
+            ui.label("Authenticator");
             let resp = ui.add_enabled(
                 can_type,
                 egui::TextEdit::singleline(&mut self.code)
@@ -799,16 +816,20 @@ impl App {
     /// from the top of the window, also when the window is too small for it.
     fn main_view(&mut self, ui: &mut egui::Ui) -> f32 {
         egui::MenuBar::new().ui(ui, |ui| {
+            if ui
+                .selectable_label(self.section.is_none(), "Connect")
+                .clicked()
+            {
+                self.section = None;
+                self.asked_height = None;
+                self.focus_code = true;
+            }
             for section in Section::ALL {
                 if ui
                     .selectable_label(self.section == Some(section), section.label())
                     .clicked()
                 {
-                    self.section = if self.section == Some(section) {
-                        None
-                    } else {
-                        Some(section)
-                    };
+                    self.section = Some(section);
                     self.asked_height = None;
                 }
             }
@@ -822,11 +843,13 @@ impl App {
         });
         ui.separator();
         ui.add_space(6.0);
-        self.banner(ui);
-        ui.add_space(6.0);
-        self.using_rows(ui);
-        ui.add_space(6.0);
-        self.code_row(ui);
+        if self.section.is_none() {
+            self.banner(ui);
+            ui.add_space(6.0);
+            self.using_rows(ui);
+            ui.add_space(6.0);
+            self.code_row(ui);
+        }
         if let Some(release) = self.update_available.clone() {
             ui.horizontal(|ui| {
                 ui.label(format!("Version {} is available.", release.version));

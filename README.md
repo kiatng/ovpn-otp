@@ -15,7 +15,7 @@ Many firewall VPNs ask for "password followed by your 2FA code" in one masked pa
 
 - **Saved login.** Your user name and password are kept in the credential store of your operating system (Windows Credential Manager, or the desktop keyring on Linux), never in a file.
 - **A separate, visible code box.** You type the 6 digits on their own, in plain sight, and ovpn-otp appends them to the password for you.
-- **Know what you are connected to.** The window and `ovpn-otp status` always show the profile file, the server with the port and protocol, the name of the connection, your user name, and the state in colour and in words: Connected, Connecting…, Disconnected or Failed.
+- **Know what you are connected to.** The Connect view and `ovpn-otp status` show the profile file, the server with the port and protocol, the name of the connection, your user name, and the state in colour and in words: Connected, Connecting…, Disconnected or Failed.
 - **See what is going on.** A live timeline of the connection steps, bytes in and out with the current speed, how long ago data last arrived, your tunnel address, the routes and DNS servers the server sent, an optional check that a host behind the VPN answers (with the round-trip time), a full log with a level filter, and the complete conversation with OpenVPN, with secrets hidden.
 - **Keep-alive and reconnect.** Keep-alive pings detect a dead link, and ovpn-otp reconnects by itself with a growing wait between tries. Because the server wants a fresh code after a real drop, ovpn-otp asks you for one.
 - **A reason when a connect fails.** ovpn-otp tells you whether the server rejected the login, closed the connection without a word, shares no cipher with OpenVPN, or could not be reached. It does not keep asking for code after code while the real problem is somewhere else, and a connect that makes no progress ends by itself with the step it was stuck in.
@@ -74,7 +74,7 @@ The update downloads the release for your operating system and checks the archiv
 You need your VPN profile, a `.ovpn` file. On a Sophos Firewall you download it from the user portal, in the SSL VPN section; other servers have a similar download. If you already imported it into another client, download it again, because ovpn-otp needs the file itself.
 
 1. Put the profile somewhere you like, for example next to your settings file.
-2. Start `ovpn-otp-gui`. It opens with **Settings** open because there is no profile yet. Click **Change** beside **Profile** and choose the `.ovpn` file. The **Server** and **Profile** rows at the top now show what you will connect to.
+2. Start `ovpn-otp-gui`. On **Connect**, click **Choose a profile** and select the `.ovpn` file. The **Server** and **Profile** rows at the top now show what you will connect to.
 3. Enter your user name and password in the **User** and **Password** rows. Leave **Remember** ticked to keep them in the credential store.
 4. Open your authenticator app, type the 6-digit code into the code box, and press Enter or click **Connect**.
 
@@ -95,7 +95,7 @@ ovpn-otp never guesses your user name. It uses the one you typed, either in the 
 
 ## The window
 
-The window is small on purpose: about 420 by 290 points, and only as tall as what it shows. The top part is always there, and it answers three questions at a glance.
+The window is small on purpose: about 420 by 290 points. The **Connect** view answers three questions at a glance.
 
 **What state is the connection in?** The banner says it in colour and in words:
 
@@ -113,11 +113,11 @@ The window is small on purpose: about 420 by 290 points, and only as tall as wha
 | ![The window before a connect: Disconnected, with the user name, password and code boxes](docs/window-disconnected.png) | ![The window while it connects: Connecting, opening a connection to the server, 3 seconds](docs/window-connecting.png) |
 | ![The window when the connect failed: Failed, with the reason](docs/window-failed.png) | ![The window with Details open: traffic, routes, DNS and the steps of the connection](docs/window-details.png) |
 
-**What am I connecting to?** Below the banner, four rows that never go away: **Connection** (the name in the settings), **Server** (host, port and protocol from the profile), **Profile** (the `.ovpn` file in use) and **User**. While a session runs, an **Address** row shows the address OpenVPN is talking to, when the profile names the server another way.
+**What am I connecting to?** Below the banner, four rows: **Connection** (the name in the settings), **Server** (host, port and protocol from the profile), **Profile** (the `.ovpn` file in use) and **User**. While a session runs, an **Address** row shows the address OpenVPN is talking to, when the profile names the server another way.
 
-**What do I do next?** The code box and one button: **Connect**, or **Disconnect** while a session runs. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server. With a saved login the **User** row shows only your user name, with **Change** next to it; the password box comes back when you click that.
+**What do I do next?** The code box and one button: **Connect**, or **Disconnect** while a session runs. The code box takes digits only and counts them ("4 of 6 digits"), so a short or mistyped code is caught before it reaches the server. With a saved login, the **User** row shows your user name. Click it to edit the login. Click the profile path to choose a different profile.
 
-Choose **Details**, **Log**, **Wire** or **Settings** at the top to open it. Choose it again to close it.
+Choose **Details**, **Log**, **Wire** or **Settings** at the top to open that view. Choose **Connect** to return to the connection.
 
 | Part | What it shows |
 | --- | --- |
