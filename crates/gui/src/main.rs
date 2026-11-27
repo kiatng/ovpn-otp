@@ -65,7 +65,25 @@ const SECTION_HEIGHT: f32 = 340.0;
 const SECTION_MIN_HEIGHT: f32 = 160.0;
 
 fn main() -> eframe::Result {
-    let path = settings::settings_path(std::env::args_os().nth(1).map(PathBuf::from).as_deref());
+    let requested = std::env::args_os().nth(1).map(PathBuf::from);
+    #[cfg(feature = "diagnostic-test")]
+    let requested = requested.or_else(|| {
+        std::env::current_exe()
+            .ok()?
+            .parent()
+            .map(|dir| dir.join("diagnostic-config.toml"))
+            .filter(|p| p.is_file())
+    });
+    #[cfg(feature = "diagnostic-test")]
+    if std::env::var_os(ovpn_otp_core::runtime::RUNTIME_ENV).is_none() {
+        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+            std::env::set_var(
+                ovpn_otp_core::runtime::RUNTIME_ENV,
+                PathBuf::from(local).join("ovpn-otp-test").join("run"),
+            );
+        }
+    }
+    let path = settings::settings_path(requested.as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ovpn-otp")
