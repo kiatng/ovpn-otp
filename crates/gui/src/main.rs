@@ -759,6 +759,24 @@ impl App {
                     });
                     ui.end_row();
                 }
+
+                ui.label(RichText::new("Authenticator").weak());
+                self.code_row(ui);
+                ui.end_row();
+                let waiting = active && self.snap.phase == Phase::NeedCode;
+                if !active && !waiting {
+                    ui.label("");
+                    ui.label(
+                        RichText::new(format!(
+                            "Code from your authenticator app: {} of {} digits",
+                            self.code.len(),
+                            self.digits()
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                    ui.end_row();
+                }
             });
     }
 
@@ -770,7 +788,6 @@ impl App {
         let can_type = !active || waiting;
         let mut enter = false;
         ui.horizontal(|ui| {
-            ui.label("Authenticator");
             let resp = ui.add_enabled(
                 can_type,
                 egui::TextEdit::singleline(&mut self.code)
@@ -799,17 +816,6 @@ impl App {
                 }
             }
         });
-        // While the session waits for a code, the banner says why.
-        if can_type && !waiting {
-            ui.label(
-                RichText::new(format!(
-                    "Code from your authenticator app: {} of {digits} digits",
-                    self.code.len()
-                ))
-                .small()
-                .weak(),
-            );
-        }
     }
 
     /// Everything that is always shown. Gives back how tall it is, measured
@@ -847,8 +853,6 @@ impl App {
             self.banner(ui);
             ui.add_space(6.0);
             self.using_rows(ui);
-            ui.add_space(6.0);
-            self.code_row(ui);
         }
         if let Some(release) = self.update_available.clone() {
             ui.horizontal(|ui| {
@@ -1047,7 +1051,7 @@ impl App {
     fn wire_section(&self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(
-                "Every message between this app and the VPN connection. Passwords and codes are hidden.",
+                "Show the messages between us and the OpenVPN app. We use OpenVPN as the intermediary to connect to the remote server. Passwords and codes are masked.",
             )
             .small()
             .weak(),
