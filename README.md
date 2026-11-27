@@ -16,7 +16,7 @@ Many firewall VPNs ask for "password followed by your 2FA code" in one masked pa
 - **Saved login.** Your user name and password are kept in the credential store of your operating system (Windows Credential Manager, or the desktop keyring on Linux), never in a file.
 - **A separate, visible code box.** You type the 6 digits on their own, in plain sight, and ovpn-otp appends them to the password for you.
 - **Know what you are connected to.** The Connect view and `ovpn-otp status` show the profile file, the server with the port and protocol, the name of the connection, your user name, and the state in colour and in words: Connected, Connecting…, Disconnected or Failed.
-- **See what is going on.** A live timeline of the connection steps, bytes in and out with the current speed, how long ago data last arrived, your tunnel address, the routes and DNS servers the server sent, an optional check that a host behind the VPN answers (with the round-trip time), a full log with a level filter, and the complete conversation with OpenVPN, with secrets hidden.
+- **See what is going on.** Connection logs, bytes in and out with the current speed, how long ago data last arrived, your tunnel address, the routes and DNS servers the server sent, an optional check that a host behind the VPN answers (with the round-trip time), a full log with a level filter, and the complete conversation with OpenVPN, with secrets hidden.
 - **Keep-alive and reconnect.** Keep-alive pings detect a dead link, and ovpn-otp reconnects by itself with a growing wait between tries. Because the server wants a fresh code after a real drop, ovpn-otp asks you for one.
 - **A reason when a connect fails.** ovpn-otp tells you whether the server rejected the login, closed the connection without a word, shares no cipher with OpenVPN, or could not be reached. It does not keep asking for code after code while the real problem is somewhere else, and a connect that makes no progress ends by itself with the step it was stuck in.
 - **Made for scripts and AI agents too.** Everything the window does and every setting is a command, with JSON output and an exit code for each outcome.
@@ -111,7 +111,7 @@ The window is small on purpose: about 420 by 290 points. The **Connect** view an
 | | |
 | --- | --- |
 | ![The window before a connect: Disconnected, with the user name, password and code boxes](docs/window-disconnected.png) | ![The window while it connects: Connecting, opening a connection to the server, 3 seconds](docs/window-connecting.png) |
-| ![The window when the connect failed: Failed, with the reason](docs/window-failed.png) | ![The window with Details open: traffic, routes, DNS and the steps of the connection](docs/window-details.png) |
+| ![The window when the connect failed: Failed, with the reason](docs/window-failed.png) | ![The window with Details open: traffic, routes and DNS](docs/window-details.png) |
 
 **What am I connecting to?** Below the banner, four rows: **Connection** (the name in the settings), **Server** (host, port and protocol from the profile), **Profile** (the `.ovpn` file in use) and **User**. While a session runs, an **Address** row shows the address OpenVPN is talking to, when the profile names the server another way.
 
