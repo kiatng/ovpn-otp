@@ -353,6 +353,13 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
     // well it would lose against that `--verb`.
     let verb = extra.iter().filter_map(|l| verb_of(l)).next_back();
     extra.retain(|l| verb_of(l).is_none());
+    // A diagnostic run must not leave an unfiltered OpenVPN log elsewhere.
+    if cfg!(feature = "diagnostic-test") {
+        extra.retain(|line| {
+            !option_line(line)
+                .is_some_and(|opt| ["log", "log-append", "syslog"].contains(&opt.name))
+        });
+    }
     let remote_override = settings.profile.remote.trim();
     let found = scan(profile, &extra);
     let skip_private = remote_override.is_empty()
@@ -419,7 +426,8 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
                 }
             }
             o if DROPPED.contains(&o)
-                || (cfg!(feature = "diagnostic-test") && ["log", "log-append"].contains(&o)) =>
+                || (cfg!(feature = "diagnostic-test")
+                    && ["log", "log-append", "syslog"].contains(&o)) =>
             {
                 out.push_str("# removed by ovpn-otp: ");
                 out.push_str(trimmed);
