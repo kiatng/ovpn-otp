@@ -1500,6 +1500,11 @@ fn spawn_reader(stream: TcpStream, gen: u64, tx: Sender<Input>) {
 // a code as well, because a code can have been discarded before a log arrives.
 #[cfg(feature = "diagnostic-test")]
 fn redact_test_text(text: &mut String, password: &str, digits: u8) {
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("auth-token") || lower.contains("scrv1:") {
+        *text = "******** (authentication data hidden)".into();
+        return;
+    }
     if !password.is_empty() {
         *text = text.replace(password, "********");
     }
@@ -1704,6 +1709,33 @@ mod tests {
         let secs: Vec<u64> = (1..=6).map(|a| backoff(&ka, a).as_secs()).collect();
         assert_eq!(secs, vec![2, 4, 8, 16, 30, 30]);
         assert_eq!(backoff(&ka, 200).as_secs(), 30);
+    }
+
+    #[cfg(feature = "diagnostic-test")]
+    #[test]
+    fn diagnostic_events_remove_password_and_digit_codes() {
+        let mut event = Event::Log(LogEntry {
+            time: 1,
+            level: LogLevel::Info,
+            message: "received passWord-123 and 871234".into(),
+        });
+        redact_test_event(&mut event, "passWord-123", 6);
+        let Event::Log(entry) = event else {
+            panic!("expected log")
+        };
+        assert!(!entry.message.contains("passWord-123"));
+        assert!(!entry.message.contains("871234"));
+        assert!(entry.message.contains("********"));
+        let mut wire = Event::Wire {
+            at: now(),
+            dir: Direction::In,
+            text: ">PASSWORD:Auth-Token:secret".into(),
+        };
+        redact_test_event(&mut wire, "secret", 6);
+        let Event::Wire { text, .. } = wire else {
+            panic!("expected wire")
+        };
+        assert!(!text.contains("secret"));
     }
 
     #[test]
