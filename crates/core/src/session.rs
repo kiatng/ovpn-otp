@@ -1736,6 +1736,12 @@ mod tests {
             panic!("expected wire")
         };
         assert!(!text.contains("secret"));
+        let mut challenge = "SCRV1:encoded-password:encoded-code".to_string();
+        redact_test_text(&mut challenge, "different", 6);
+        assert!(!challenge.contains("encoded-password"));
+        let mut token = "PUSH_REPLY,auth-token,unrelated-secret".to_string();
+        redact_test_text(&mut token, "different", 6);
+        assert!(!token.contains("unrelated-secret"));
     }
 
     #[test]
