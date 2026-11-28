@@ -11,6 +11,12 @@
 //! * `stop` — created by `ovpn-otp disconnect`; the session sees it and stops;
 //! * `code` — created by `ovpn-otp code`; the session reads the code, deletes
 //!   the file at once and uses the code for the next login;
+//! * `connect.request` — created by `ovpn-otp connect --elevate`; the desktop
+//!   window reads it once and runs the connect itself, with its saved login;
+//! * `show.request` — created by a second `ovpn-otp-gui` start; the running
+//!   window comes to the front instead;
+//! * `gui.lock` — held with an OS lock for as long as the window runs, so a
+//!   second start knows one is already there (`gui.json` says which);
 //! * `<name>.ovpn` — the prepared profile, removed when the session ends.
 
 use std::fs::{File, OpenOptions};
@@ -98,12 +104,31 @@ impl StatusFile {
     }
 }
 
-/// Whether a process with this id exists. Only checked on Linux; elsewhere
-/// the update time alone decides.
+/// Whether a process with this id exists. Only checked on Linux and Windows;
+/// elsewhere the update time alone decides.
 fn pid_alive(pid: u32) -> bool {
-    if cfg!(target_os = "linux") {
+    #[cfg(target_os = "linux")]
+    {
         Path::new("/proc").join(pid.to_string()).exists()
-    } else {
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            CloseHandle(handle);
+            true
+        }
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        let _ = pid;
         true
     }
 }
@@ -146,6 +171,18 @@ impl RuntimeDir {
     }
     pub fn code_path(&self) -> PathBuf {
         self.path.join("code")
+    }
+    pub fn show_request_path(&self) -> PathBuf {
+        self.path.join("show.request")
+    }
+    pub fn connect_request_path(&self) -> PathBuf {
+        self.path.join("connect.request")
+    }
+    pub fn gui_lock_path(&self) -> PathBuf {
+        self.path.join("gui.lock")
+    }
+    pub fn gui_info_path(&self) -> PathBuf {
+        self.path.join("gui.json")
     }
 
     /// The log of the current (or last) session, oldest line first.
@@ -197,6 +234,132 @@ impl RuntimeDir {
     /// True (once) if someone asked this session to stop.
     pub fn take_stop_request(&self) -> bool {
         std::fs::remove_file(self.stop_path()).is_ok()
+    }
+
+    /// Ask the running window to show itself (a second `ovpn-otp-gui` start).
+    pub fn request_show(&self) -> std::io::Result<()> {
+        File::create(self.show_request_path()).map(|_| ())
+    }
+
+    /// True (once) if someone asked the window to show itself.
+    pub fn take_show_request(&self) -> bool {
+        std::fs::remove_file(self.show_request_path()).is_ok()
+    }
+
+    /// Ask the running window to connect: the code on stdin has been checked;
+    /// the window uses its saved login for the rest.
+    pub fn submit_connect_request(&self, request: &ConnectRequest) -> std::io::Result<()> {
+        let text = serde_json::to_string(request)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let tmp = self.path.join("connect.request.tmp");
+        write_private(&tmp, text.as_bytes())?;
+        std::fs::rename(&tmp, self.connect_request_path())
+    }
+
+    /// The connect request someone handed in, once.
+    pub fn take_connect_request(&self) -> Option<ConnectRequest> {
+        let path = self.connect_request_path();
+        let text = std::fs::read_to_string(&path).ok()?;
+        let _ = std::fs::remove_file(&path);
+        serde_json::from_str(&text).ok()
+    }
+
+    /// Who runs the desktop window, from `gui.json`.
+    pub fn read_gui_info(&self) -> Option<GuiInfo> {
+        let text = std::fs::read_to_string(self.gui_info_path()).ok()?;
+        serde_json::from_str(&text).ok()
+    }
+
+    /// A short window is left before the info file is there; read until it
+    /// says who runs, or give up after `wait`.
+    pub fn wait_for_gui_info(&self, wait: Duration) -> Option<GuiInfo> {
+        let deadline = Instant::now() + wait;
+        loop {
+            if let Some(info) = self.read_gui_info() {
+                if info.pid != 0 {
+                    return Some(info);
+                }
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Who runs the desktop window: written into `gui.json` next to the lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuiInfo {
+    /// The process id of the window. 0 when unknown.
+    #[serde(default)]
+    pub pid: u32,
+    /// Whether the window's process runs with administrator rights (Windows).
+    #[serde(default)]
+    pub elevated: bool,
+    /// The program version of the window.
+    #[serde(default)]
+    pub version: String,
+}
+
+impl GuiInfo {
+    /// Whether the process this info names is alive.
+    pub fn pid_alive(&self) -> bool {
+        self.pid != 0 && pid_alive(self.pid)
+    }
+}
+
+/// A connect asked for by `ovpn-otp connect --elevate`.
+///
+/// It carries the authenticator code, and never a password: the window
+/// connects with its saved login, so a remote caller never handles one.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConnectRequest {
+    /// The authenticator code, already checked by the sender.
+    #[serde(default)]
+    pub code: String,
+    /// The user name to use instead of the saved one. The password still
+    /// comes from the saved login, so this only renames it.
+    #[serde(default)]
+    pub username: String,
+}
+
+/// The single-instance lock of the desktop window.
+///
+/// The window holds an exclusive OS lock on `gui.lock` for as long as it runs,
+/// so a second start can tell "one is already there" without a process list.
+/// Dropping the lock releases it, including after a crash.
+pub struct GuiLock {
+    _file: File,
+}
+
+impl GuiLock {
+    /// Take the lock. `Ok(Ok(lock))` when this is the only window;
+    /// `Ok(Err(info))` when another one already runs (it keeps the lock).
+    pub fn acquire(dir: &RuntimeDir) -> std::io::Result<Result<GuiLock, GuiInfo>> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .read(true)
+            .open(dir.gui_lock_path())?;
+        match file.try_lock() {
+            Ok(()) => {
+                let info = GuiInfo {
+                    pid: std::process::id(),
+                    elevated: crate::launch::elevated(),
+                    version: env!("CARGO_PKG_VERSION").to_string(),
+                };
+                let text = serde_json::to_string(&info)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+                // A separate file, so others can read it while the lock file
+                // itself is held (on Windows a locked byte range blocks reads).
+                std::fs::write(dir.gui_info_path(), text)?;
+                // The lock file stays open and locked for the life of the app.
+                Ok(Ok(GuiLock { _file: file }))
+            }
+            Err(_) => Ok(Err(dir.read_gui_info().unwrap_or_default())),
+        }
     }
 }
 
@@ -536,5 +699,47 @@ mod tests {
         snap.bytes_in = 7;
         rec.write_status(&snap, true, false);
         assert_eq!(dir.read_status().unwrap().snapshot.bytes_in, 0);
+    }
+
+    #[test]
+    fn only_one_window_holds_the_gui_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
+        let first = GuiLock::acquire(&dir).unwrap().ok().unwrap();
+        // A second start sees the first one, with its pid and version.
+        let second = GuiLock::acquire(&dir).unwrap().err().unwrap();
+        assert_ne!(second.pid, 0);
+        assert_eq!(second.pid, std::process::id());
+        assert!(!second.version.is_empty());
+        assert!(second.pid_alive());
+        drop(first);
+        // The lock is free again once the first window is gone.
+        assert!(GuiLock::acquire(&dir).unwrap().is_ok());
+    }
+
+    #[test]
+    fn show_and_connect_requests_are_taken_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = RuntimeDir::at(tmp.path().to_path_buf()).unwrap();
+        assert!(!dir.take_show_request());
+        dir.request_show().unwrap();
+        assert!(dir.show_request_path().exists());
+        assert!(dir.take_show_request());
+        assert!(!dir.take_show_request());
+
+        assert_eq!(dir.take_connect_request(), None);
+        dir.submit_connect_request(&ConnectRequest {
+            code: "135790".into(),
+            username: String::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            dir.take_connect_request(),
+            Some(ConnectRequest {
+                code: "135790".into(),
+                username: String::new(),
+            })
+        );
+        assert_eq!(dir.take_connect_request(), None);
     }
 }

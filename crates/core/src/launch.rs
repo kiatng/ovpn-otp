@@ -214,6 +214,62 @@ pub fn service_available() -> bool {
     }
 }
 
+/// Whether this program runs with administrator rights (Windows) or as root
+/// (Linux). When the check cannot be made, this answers true: a wrong "not
+/// elevated" warning is worse than a missing one.
+pub fn elevated() -> bool {
+    #[cfg(windows)]
+    {
+        windows::is_elevated()
+    }
+    #[cfg(not(windows))]
+    {
+        is_root()
+    }
+}
+
+/// Whether starting OpenVPN the way the settings describe needs administrator
+/// rights: on Windows any direct start does (only the interactive service does
+/// not), on Linux the `sudo`/`pkexec` prefix asks for them by itself.
+pub fn needs_admin(settings: &Settings) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    let launch = settings.platform().launch.trim().to_ascii_lowercase();
+    if launch == "service" {
+        // The user said the service runs OpenVPN; a moment where its pipe is
+        // busy with another session does not change that.
+        return false;
+    }
+    match OpenVpnLauncher::from_settings(settings) {
+        Ok(l) => matches!(l.mode, LaunchMode::Direct { .. }),
+        Err(_) => true,
+    }
+}
+
+/// Keep the terminal's pipes out of the next child this process starts (see
+/// [`windows::make_stdio_uninheritable`]). Nothing to do off Windows.
+pub fn detach_stdio() {
+    #[cfg(windows)]
+    windows::make_stdio_uninheritable();
+}
+
+/// The advice for a connect that will fail for lack of rights, or an empty
+/// string when the rights are there.
+pub fn rights_advice(settings: &Settings) -> String {
+    if !needs_admin(settings) || elevated() {
+        return String::new();
+    }
+    if cfg!(windows) {
+        "OpenVPN will be started directly, and adding the network routes needs \
+         administrator rights. Start ovpn-otp as administrator, or let the \
+         OpenVPN Interactive Service start OpenVPN (see the README)."
+            .to_string()
+    } else {
+        String::new()
+    }
+}
+
 /// A free TCP port on 127.0.0.1 for the management interface.
 fn free_port() -> std::io::Result<u16> {
     let l = TcpListener::bind("127.0.0.1:0")?;
@@ -429,9 +485,65 @@ mod windows {
 
     const PIPE: &str = r"\\.\pipe\openvpn\service";
 
+    /// Whether this process runs with administrator rights (an elevated token).
+    pub fn is_elevated() -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_QUERY};
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        unsafe {
+            let mut token = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return true;
+            }
+            let mut elevation: u32 = 0;
+            let mut returned = 0u32;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut u32).cast(),
+                std::mem::size_of::<u32>() as u32,
+                &mut returned,
+            );
+            CloseHandle(token);
+            ok == 0 || elevation != 0
+        }
+    }
+
+    /// Stop this process's own stdio handles from being inherited by the next
+    /// child it starts.
+    ///
+    /// A child is started with every inheritable handle of its parent, not
+    /// only the three stdio ones it is given. The terminal's pipes are such
+    /// handles (WSL marks them inheritable), and WSL waits for every process
+    /// that holds one. A detached session process would then keep `connect
+    /// --background` from returning for as long as the session runs. Clearing
+    /// the inherit flag on our stdio keeps the pipes out of the child.
+    pub fn make_stdio_uninheritable() {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::GetStdHandle;
+        const STD_HANDLES: [u32; 3] = [
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+        ];
+        unsafe {
+            for which in STD_HANDLES {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != -1isize as _ {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+
     pub fn service_available() -> bool {
         // Opening and closing the pipe without writing does not start anything.
-        OpenOptions::new().read(true).write(true).open(PIPE).is_ok()
+        // When every pipe instance is busy (another session is connecting right
+        // now), the service is still there: that error means available too.
+        match OpenOptions::new().read(true).write(true).open(PIPE) {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(231), // ERROR_PIPE_BUSY
+        }
     }
 
     pub fn launch_service(req: &LaunchRequest) -> Result<Launched, LaunchError> {

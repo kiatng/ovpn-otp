@@ -27,6 +27,8 @@ pub enum Outcome {
     /// The secure channel is set up, then the server closes the connection
     /// without a reason, as some firewalls do.
     Reset,
+    /// The server closes the connection during the TLS handshake.
+    ResetDuringTls,
     /// No server answers.
     Unreachable,
     /// The server refuses because it shares no data cipher with the client.
@@ -37,6 +39,9 @@ pub enum Outcome {
     HangInAuth,
     /// The login is accepted, then the server never sends its settings.
     HangInConfig,
+    /// The login is accepted and the tunnel comes up, but the routes cannot
+    /// be added (no administrator rights on Windows).
+    RouteError,
 }
 
 #[derive(Clone, Default)]
@@ -115,11 +120,13 @@ impl Fake {
                         .map(|o| match o.trim() {
                             "login" => Ok(Outcome::Login),
                             "reset" => Ok(Outcome::Reset),
+                            "reset-tls" => Ok(Outcome::ResetDuringTls),
                             "unreachable" => Ok(Outcome::Unreachable),
                             "no-shared-cipher" => Ok(Outcome::NoSharedCipher),
                             "hang" => Ok(Outcome::Hang),
                             "hang-in-auth" => Ok(Outcome::HangInAuth),
                             "hang-in-config" => Ok(Outcome::HangInConfig),
+                            "route-error" => Ok(Outcome::RouteError),
                             other => Err(format!("unknown outcome `{other}`")),
                         })
                         .collect();
@@ -485,7 +492,12 @@ impl Conn<'_> {
             Outcome::Unreachable | Outcome::Hang => unreachable!("handled above"),
             Outcome::HangInAuth => {}
             Outcome::HangInConfig => self.emit_state("GET_CONFIG", ",,,,,"),
-            Outcome::Reset => {
+            Outcome::Reset | Outcome::ResetDuringTls => {
+                if outcome == Outcome::Reset {
+                    self.emit(
+                        ">LOG:1700000002,I,Control Channel: TLSv1.3, cipher TLS_AES_256_GCM_SHA384",
+                    );
+                }
                 self.emit(">LOG:1700000002,N,Connection reset, restarting [0]");
                 self.emit(
                     ">LOG:1700000002,I,SIGUSR1[soft,connection-reset] received, process restarting",
@@ -502,17 +514,26 @@ impl Conn<'_> {
                 self.emit_state("RECONNECTING", "auth-failure,,,,,");
                 self.emit(restart);
             }
-            Outcome::Login if password == *self.fake.accept.lock().unwrap() => {
+            Outcome::Login | Outcome::RouteError
+                if password == *self.fake.accept.lock().unwrap() =>
+            {
                 self.emit(">LOG:1700000003,I,PUSH: Received control message: 'PUSH_REPLY,route 10.20.0.0 255.255.0.0,dhcp-option DNS 10.20.0.53,ifconfig 10.8.0.6 255.255.255.0'");
                 self.emit_state("GET_CONFIG", ",,,,,");
                 self.emit_state("ASSIGN_IP", ",10.8.0.6,,,,");
                 self.emit_state("ADD_ROUTES", ",,,,,");
                 let (ip, port) = SERVER.split_once(':').unwrap();
-                self.emit_state("CONNECTED", &format!("SUCCESS,10.8.0.6,{ip},{port},,"));
+                let detail = if outcome == Outcome::RouteError {
+                    // Like OpenVPN on Windows when the routes cannot be added.
+                    self.emit(">LOG:1700000003,N,Windows route add command failed [adaptive]: returned error code 1");
+                    "ROUTE_ERROR"
+                } else {
+                    "SUCCESS"
+                };
+                self.emit_state("CONNECTED", &format!("{detail},10.8.0.6,{ip},{port},,"));
                 self.emit(">BYTECOUNT:1000,500");
                 self.emit(">BYTECOUNT:5000,900");
             }
-            Outcome::Login => {
+            Outcome::Login | Outcome::RouteError => {
                 self.emit(">PASSWORD:Verification Failed: 'Auth'");
                 self.emit_state("RECONNECTING", "auth-failure,,,,,");
                 self.emit(restart);

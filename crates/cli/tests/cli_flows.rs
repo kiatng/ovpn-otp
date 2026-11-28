@@ -207,6 +207,29 @@ fn assert_no_secrets(sandbox: &Sandbox, printed: &[&Ran]) {
 }
 
 #[test]
+fn elevate_connect_runs_here_when_there_is_nothing_to_elevate() {
+    // On this system (no desktop window with administrator rights) --elevate
+    // says so and runs the connect itself, like a background one.
+    let sandbox = Sandbox::new("login");
+    let ran = sandbox.run(
+        &[
+            "connect",
+            "--username",
+            USER,
+            "--password-stdin",
+            "--code-stdin",
+            "--elevate",
+            "--json",
+        ],
+        &format!("{PASSWORD}\n{CODE}\n"),
+    );
+    assert_eq!(ran.code, 0, "stderr: {}", ran.stderr);
+    assert!(ran.stderr.contains("Connected."), "{}", ran.stderr);
+    assert_eq!(ran.json()["phase"], "connected");
+    assert_no_secrets(&sandbox, &[&ran]);
+}
+
+#[test]
 fn background_connect_returns_when_the_tunnel_is_up() {
     let sandbox = Sandbox::new("login");
     let ran = sandbox.connect_background();

@@ -380,9 +380,8 @@ fn connection_reset_during_login_ends_with_server_reset() {
     assert_eq!(failure.kind, FailureKind::ServerReset, "{failure:?}");
     for cause in [
         "127.0.0.1:11944",
-        "code was wrong",
-        "password is wrong",
-        "cipher mismatch",
+        "closed the connection during login",
+        "select the profile downloaded for this user",
     ] {
         assert!(
             failure.message.contains(cause),

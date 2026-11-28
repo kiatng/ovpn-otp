@@ -265,6 +265,36 @@ fn rejected_login_asks_for_a_new_code() {
 }
 
 #[test]
+fn route_error_ends_as_a_failure_that_says_what_to_do() {
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::RouteError]);
+    let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
+    let mut seen = Vec::new();
+    let ev = wait_for(&h, &mut seen, "end", is_ended);
+    let Event::Ended { reason } = ev else {
+        unreachable!()
+    };
+    let EndReason::Failed(f) = reason else {
+        panic!("expected a failure, got {reason:?}")
+    };
+    assert_eq!(f.kind, FailureKind::Failed);
+    assert!(f.message.contains("routes"), "{}", f.message);
+    if cfg!(windows) {
+        assert!(f.message.contains("administrator"), "{}", f.message);
+    }
+    // The picture the window and `status` show is Failed, not Connected.
+    let mut snap = Snapshot::default();
+    for e in &seen {
+        snap.apply(e);
+    }
+    assert_eq!(snap.phase, Phase::Failed);
+    assert!(snap
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("routes"));
+}
+
+#[test]
 fn link_drop_waits_backoff_and_asks_for_fresh_code() {
     let fake = Fake::new("pw123456");
     let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
@@ -461,6 +491,20 @@ fn snapshot_of(seen: &[Event]) -> Snapshot {
         snap.apply(e);
     }
     snap
+}
+
+/// A TLS reset should point to the client profile, not a rejected code.
+#[test]
+fn reset_before_tls_completion_suggests_checking_the_profile() {
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::ResetDuringTls]);
+    let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
+    let mut seen = Vec::new();
+    let failure = failed_end(&h, &mut seen);
+    assert_eq!(failure.kind, FailureKind::ServerReset);
+    assert!(failure.message.contains("before OpenVPN reported"));
+    assert!(failure.message.contains("profile downloaded for this user"));
+    assert!(!failure.message.contains("code was wrong"));
+    assert_eq!(need_code_count(&seen), 0);
 }
 
 /// The failure this was first reported with: the secure channel is set up,

@@ -421,6 +421,8 @@ struct Engine {
     // State of the current try, reset when the hold is released.
     /// The server answered (OpenVPN reached `AUTH`), so the login may have been sent to it.
     reached_auth: bool,
+    /// Whether OpenVPN reported that the TLS control channel is established.
+    tls_established: bool,
     /// The code handed to OpenVPN for this try, kept until it is known whether
     /// it left this machine. A code the server never saw can be used again.
     sent_code: Option<(String, Instant)>,
@@ -460,6 +462,8 @@ struct Engine {
     drop_reason: Option<String>,
     /// OpenVPN is being stopped because a try failed in a way that retrying will not fix.
     end_failure: Option<Failure>,
+    /// The routes could not be added; the session is being ended for it.
+    route_error_failed: bool,
     /// Why OpenVPN said it was exiting by itself.
     exit_failure: Option<Failure>,
     stop_deadline: Option<Instant>,
@@ -494,6 +498,7 @@ impl Engine {
             ever_connected: false,
             unreachable_tries: 0,
             reached_auth: false,
+            tls_established: false,
             sent_code: None,
             cipher_error: None,
             auth_reason: None,
@@ -516,6 +521,7 @@ impl Engine {
             stopping: false,
             drop_reason: None,
             end_failure: None,
+            route_error_failed: false,
             exit_failure: None,
             stop_deadline: None,
             fatal: None,
@@ -598,6 +604,7 @@ impl Engine {
         self.stopping = false;
         self.drop_reason = None;
         self.end_failure = None;
+        self.route_error_failed = false;
         self.exit_failure = None;
         self.stop_deadline = None;
         self.fatal = None;
@@ -608,6 +615,7 @@ impl Engine {
     /// Forget what the last try found out, before the next one starts.
     fn reset_try_state(&mut self) {
         self.reached_auth = false;
+        self.tls_established = false;
         self.cipher_error = None;
         self.auth_reason = None;
         self.last_problem = None;
@@ -1081,6 +1089,20 @@ impl Engine {
     }
 
     fn on_log(&mut self, entry: LogEntry) {
+        if entry.message.starts_with("Control Channel: TLS")
+            || entry.message.contains("Peer Connection Initiated with")
+        {
+            self.tls_established = true;
+        }
+        // OpenVPN also reports a route failure only in the log, before it
+        // reaches CONNECTED; on Windows that message says the routes are lost.
+        if cfg!(windows)
+            && !self.route_error_failed
+            && (self.connected || self.last_state == "ADD_ROUTES")
+            && entry.message.contains("route add command failed")
+        {
+            self.fail_route_error();
+        }
         if let Some(reply) = mgmt::parse_push_reply(&entry.message) {
             self.emit(Event::Pushed(reply));
         }
@@ -1149,6 +1171,12 @@ impl Engine {
 
     fn on_state(&mut self, info: StateInfo) {
         self.last_state = info.name.clone();
+        if matches!(
+            info.name.as_str(),
+            "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" | "CONNECTED"
+        ) {
+            self.tls_established = true;
+        }
         match info.name.as_str() {
             "AUTH" | "GET_CONFIG" | "ASSIGN_IP" | "ADD_ROUTES" => {
                 // The server answered, and the login goes to it now: the code
@@ -1166,8 +1194,15 @@ impl Engine {
                 self.reached_auth = true;
                 self.sent_code = None;
                 self.progress_at = None;
-                if !self.opts.reach.host.trim().is_empty() {
-                    self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
+                if info.detail.eq_ignore_ascii_case("ROUTE_ERROR") {
+                    // The tunnel is up, but the routes are missing: end the
+                    // session as a failure instead of showing a connection
+                    // that cannot carry traffic.
+                    self.fail_route_error();
+                } else {
+                    if !self.opts.reach.host.trim().is_empty() {
+                        self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
+                    }
                 }
             }
             "RECONNECTING" => {
@@ -1199,6 +1234,27 @@ impl Engine {
             _ => {}
         }
         self.emit(Event::State { at: now(), info });
+    }
+
+    /// The tunnel is up, but the network routes could not be added: without
+    /// them nothing behind the VPN is reachable. End the session as a failure
+    /// that says what to do, instead of showing a connection that cannot work.
+    fn fail_route_error(&mut self) {
+        if self.route_error_failed {
+            return;
+        }
+        self.route_error_failed = true;
+        let why = if cfg!(windows) {
+            "The VPN connected, but Windows could not add the network routes the server sent, so nothing behind the VPN is reachable. Run ovpn-otp as administrator and connect again, or let the OpenVPN Interactive Service start OpenVPN (see the README)."
+        } else {
+            "The VPN connected, but the network routes could not be added, so nothing behind the VPN is reachable. Give openvpn the rights to change the network: see the README section \"Linux: let openvpn create the tunnel\"."
+        };
+        self.note(LogLevel::Error, why);
+        self.stopping = true;
+        self.end_failure = Some(Failure::new(FailureKind::Failed, why));
+        self.progress_at = None;
+        self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
+        self.send("signal SIGTERM", Reply::Simple);
     }
 
     /// A working connection dropped.
@@ -1315,6 +1371,18 @@ impl Engine {
                 format!(
                     "Could not reach the VPN server{at_server}.{problem} Check the network \
                      connection, and the server address and port in the profile."
+                ),
+            );
+        }
+        if detail == "connection-reset" && !self.tls_established {
+            return Failure::new(
+                FailureKind::ServerReset,
+                format!(
+                    "The server{at_server} closed the connection during login before OpenVPN \
+                     reported that the secure channel was established. If your VPN provider \
+                     gives each user a profile, select the profile downloaded for this user. \
+                     If it still fails, ask your VPN administrator to check the client \
+                     certificate and server logs."
                 ),
             );
         }

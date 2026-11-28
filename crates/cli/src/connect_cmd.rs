@@ -16,11 +16,12 @@ use chrono::Local;
 
 use ovpn_otp_core::connect::{self, Prepared};
 use ovpn_otp_core::credentials::{CredentialStore, KeyringStore, Login, Secret};
+use ovpn_otp_core::launch;
 use ovpn_otp_core::mgmt::LogLevel;
 use ovpn_otp_core::report::{
     exit_code, failure_exit_code, outcome_text, wait_verdict, StatusReport, WaitTarget,
 };
-use ovpn_otp_core::runtime::{Recorder, RuntimeDir};
+use ovpn_otp_core::runtime::{ConnectRequest, Recorder, RuntimeDir};
 use ovpn_otp_core::session::{validate_code, CodeReason, Direction, EndReason, Event};
 use ovpn_otp_core::settings::{self, LoadedSettings};
 use ovpn_otp_core::snapshot::Snapshot;
@@ -95,6 +96,14 @@ pub fn cmd_connect(path: &Path, args: ConnectArgs) -> Result<u8> {
     if args.detached {
         return run_detached(path);
     }
+    if args.timeout.is_some() && !args.background && !args.elevate {
+        return Err(usage_error(
+            "--timeout belongs to --background or --elevate",
+        ));
+    }
+    if args.json && !args.background && !args.elevate {
+        return Err(usage_error("--json belongs to --background or --elevate"));
+    }
     let loaded = settings::load(path)?;
     let digits = loaded.settings.code.digits;
     let rt = runtime()?;
@@ -104,6 +113,14 @@ pub fn cmd_connect(path: &Path, args: ConnectArgs) -> Result<u8> {
             live.pid,
             live.snapshot.phase.label()
         );
+    }
+    // Warn before the try, not only after the route failure it leads to.
+    let advice = launch::rights_advice(&loaded.settings);
+    if !advice.is_empty() && !args.elevate {
+        eprintln!("warning: {advice}");
+    }
+    if args.elevate {
+        return connect_elevated(path, &loaded, &rt, &args);
     }
     // A person at a terminal can be asked again; a script cannot.
     let asks_a_person = std::io::stdin().is_terminal() && !args.password_stdin && !args.code_stdin;
@@ -134,6 +151,210 @@ pub fn cmd_connect(path: &Path, args: ConnectArgs) -> Result<u8> {
         asks_a_person,
     };
     run_session(prepared, rt, &loaded, ui)
+}
+
+/// Read the code the way the command line asked for it.
+fn code_from_args(args: &ConnectArgs, digits: u8) -> Result<Option<String>> {
+    match (&args.code, args.code_stdin) {
+        (Some(c), _) => Ok(Some(validate_code(c, digits).map_err(usage_error)?)),
+        (None, true) => {
+            let line = stdin_line()?.unwrap_or_default();
+            Ok(Some(validate_code(&line, digits).map_err(|e| {
+                usage_error(format!(
+                    "--code-stdin: {e} (no valid code on standard input)"
+                ))
+            })?))
+        }
+        (None, false) => Ok(None),
+    }
+}
+
+/// `connect --elevate`: run the session with the administrator rights the
+/// network routes need. On Windows this hands the connect to the desktop
+/// window, started elevated when it is not running; the caller then waits for
+/// the outcome. Anywhere else, or when this process is already elevated, the
+/// session runs right here, like `--background` does.
+fn connect_elevated(
+    path: &Path,
+    loaded: &LoadedSettings,
+    rt: &RuntimeDir,
+    args: &ConnectArgs,
+) -> Result<u8> {
+    let digits = loaded.settings.code.digits;
+    let timeout = Duration::from_secs(args.timeout.unwrap_or(BACKGROUND_TIMEOUT));
+    if !cfg!(windows) {
+        eprintln!("note: --elevate is for Windows; on this system the connect runs right here.");
+        let login = get_login(loaded, args.username.clone(), args.password_stdin)?;
+        let code = code_from_args(args, digits)?;
+        return connect_background(path, loaded, rt, &login, code, timeout, args.json);
+    }
+    if launch::elevated() {
+        // Already elevated: a session here has the rights it needs.
+        let login = get_login(loaded, args.username.clone(), args.password_stdin)?;
+        let code = code_from_args(args, digits)?;
+        return connect_background(path, loaded, rt, &login, code, timeout, args.json);
+    }
+    if !launch::needs_admin(&loaded.settings) {
+        // The OpenVPN interactive service runs OpenVPN with the rights it
+        // needs, so nothing here has to be elevated.
+        eprintln!("note: the OpenVPN interactive service runs the tunnel, so no elevation is needed; connecting right here.");
+        let login = get_login(loaded, args.username.clone(), args.password_stdin)?;
+        let code = code_from_args(args, digits)?;
+        return connect_background(path, loaded, rt, &login, code, timeout, args.json);
+    }
+    // The window connects with its saved login: the password never passes
+    // through another process, and --password-stdin could not reach it anyway.
+    if args.password_stdin {
+        return Err(usage_error(
+            "--elevate uses the saved login; give the password with `ovpn-otp login` first",
+        ));
+    }
+    let code = code_from_args(args, digits)?;
+    let saved = KeyringStore
+        .load(&loaded.settings.name)
+        .map_err(|e| anyhow::anyhow!("cannot read the saved login: {e}"))?;
+    let Some(saved) = saved else {
+        bail!(
+            "the elevated window connects with its saved login, and there is none for '{}'. Run `ovpn-otp login` first.",
+            loaded.settings.name
+        );
+    };
+    if let Some(given) = &args.username {
+        if !given.trim().is_empty() && given.trim() != saved.username {
+            bail!(
+                "--elevate uses the saved login for '{}' (user {}), not --username {}.",
+                loaded.settings.name,
+                saved.username,
+                given.trim()
+            );
+        }
+    }
+    // A window that runs decides whether the session would be elevated.
+    let mut info = rt.read_gui_info().filter(|i| i.pid_alive());
+    if let Some(i) = &info {
+        if !i.elevated {
+            bail!(
+                "the ovpn-otp window that runs (process {}) does not have administrator rights, so its session would fail on the network routes. Quit it (in its tray menu), then run this command again: it starts an elevated one.",
+                i.pid
+            );
+        }
+    }
+    let started = Local::now();
+    if info.is_none() {
+        start_elevated_window()?;
+        info = rt.wait_for_gui_info(Duration::from_secs(15));
+        let Some(i) = &info else {
+            bail!("the ovpn-otp window did not start within 15 seconds.");
+        };
+        if !i.elevated {
+            bail!(
+                "the ovpn-otp window started without administrator rights, so its session would fail on the network routes. Run `ovpn-otp install` once as administrator: it creates the scheduled task that starts the window elevated without asking again."
+            );
+        }
+    }
+    let gui_pid = info.map(|i| i.pid).unwrap_or(0);
+    rt.submit_connect_request(&ConnectRequest {
+        code: code.unwrap_or_default(),
+        username: saved.username.clone(),
+    })?;
+    let own_status = || {
+        rt.read_status()
+            .filter(|s| s.pid == gui_pid && s.updated >= started)
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        std::thread::sleep(Duration::from_millis(200));
+        if let Some(st) = own_status() {
+            let report = StatusReport::from_status(Some(&st), None);
+            if let Some(c) = wait_verdict(&report, WaitTarget::Connected) {
+                eprintln!("{}", outcome_text(&report, WaitTarget::Connected));
+                if args.json {
+                    println!("{}", report.to_json());
+                }
+                return Ok(c);
+            }
+        }
+        if Instant::now() >= deadline {
+            // The session belongs to the window; ask it to stop, like
+            // `connect --background` stops its own.
+            rt.request_stop()?;
+            let stop_by = Instant::now() + Duration::from_secs(15);
+            while Instant::now() < stop_by {
+                match own_status() {
+                    Some(st) if !st.running => break,
+                    _ => std::thread::sleep(Duration::from_millis(200)),
+                }
+            }
+            eprintln!(
+                "Not connected within {} seconds. The window was asked to stop the session.",
+                timeout.as_secs()
+            );
+            if args.json {
+                println!(
+                    "{}",
+                    StatusReport::from_status(own_status().as_ref(), None).to_json()
+                );
+            }
+            return Ok(exit_code::TIMEOUT);
+        }
+    }
+}
+
+/// Start the desktop window with administrator rights: through the scheduled
+/// task that `ovpn-otp install` creates (no prompt), or with one UAC prompt.
+#[cfg(windows)]
+fn start_elevated_window() -> Result<()> {
+    if Command::new("schtasks")
+        .args(["/Run", "/TN", crate::install_cmd::APP_NAME])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        return Ok(());
+    }
+    let gui = find_gui()?;
+    let script = format!(
+        "Start-Process -FilePath {} -Verb RunAs",
+        crate::install_cmd::ps_quote(&gui.display().to_string())
+    );
+    let out = Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .output()
+        .context("cannot run PowerShell to ask Windows for administrator rights")?;
+    if !out.status.success() {
+        bail!(
+            "Windows refused to start the window as administrator (was the UAC prompt accepted?). Run `ovpn-otp install` once as administrator so the scheduled task exists."
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn start_elevated_window() -> Result<()> {
+    bail!("--elevate is for Windows")
+}
+
+/// The desktop window next to this program, or the installed one.
+#[cfg(windows)]
+fn find_gui() -> Result<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        let sibling = exe.with_file_name("ovpn-otp-gui.exe");
+        if sibling.is_file() {
+            return Ok(sibling);
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let installed = std::path::PathBuf::from(local)
+            .join("Programs")
+            .join(crate::install_cmd::APP_NAME)
+            .join("ovpn-otp-gui.exe");
+        if installed.is_file() {
+            return Ok(installed);
+        }
+    }
+    bail!(
+        "no ovpn-otp-gui.exe was found. Run `ovpn-otp install` first: it puts the programs in place and creates the scheduled task that starts the window without a UAC prompt."
+    )
 }
 
 /// How the session talks to whoever started it.
@@ -310,6 +531,9 @@ fn connect_background(
         .stdout(Stdio::null())
         .stderr(err_file);
     detach(&mut cmd);
+    // The child gets every inheritable handle this process holds; keep the
+    // terminal's pipes out of it, or WSL would wait for the whole session.
+    launch::detach_stdio();
     let started = Local::now();
     let mut child = cmd.spawn().context("cannot start the background session")?;
     {

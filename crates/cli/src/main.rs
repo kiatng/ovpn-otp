@@ -14,6 +14,7 @@
 
 mod connect_cmd;
 mod control;
+mod install_cmd;
 mod settings_cmd;
 
 use std::io::{BufRead, Write};
@@ -54,6 +55,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Install the latest verified release.
+    Update,
+    /// Put the programs where the system and other programs find them.
+    Install(install_cmd::InstallArgs),
+    /// Remove what `install` put in place.
+    Uninstall,
     /// Connect and stay connected until Ctrl+C or `ovpn-otp disconnect`.
     Connect(ConnectArgs),
     /// Give the authenticator code to a session that is waiting for one.
@@ -238,12 +245,20 @@ struct ConnectArgs {
     /// or has failed. The exit code says which.
     #[arg(long)]
     background: bool,
-    /// With --background: give up after this many seconds, stop the session
-    /// and exit with code 7. Default 150.
-    #[arg(long, value_name = "SECONDS", requires = "background")]
+    /// Windows: run the session in the desktop window instead, started with
+    /// the administrator rights the network routes need. The login must be
+    /// saved (`ovpn-otp login`); the code still comes from --code or
+    /// --code-stdin. The window is started when it is not running, through
+    /// the scheduled task that `ovpn-otp install` creates, or with one UAC
+    /// prompt.
+    #[arg(long, conflicts_with = "background")]
+    elevate: bool,
+    /// With --background or --elevate: give up after this many seconds, stop
+    /// the session and exit with code 7. Default 150.
+    #[arg(long, value_name = "SECONDS")]
     timeout: Option<u64>,
-    /// With --background: print the status as JSON when done.
-    #[arg(long, requires = "background")]
+    /// With --background or --elevate: print the status as JSON when done.
+    #[arg(long)]
     json: bool,
     /// Also print OpenVPN's log and app details.
     #[arg(short, long)]
@@ -350,7 +365,20 @@ fn main() -> ExitCode {
 fn run(cli: Cli) -> Result<u8> {
     let path = settings::settings_path(cli.config.as_deref());
     match cli.command {
+        Cmd::Update => {
+            match ovpn_otp_core::update::check().map_err(anyhow::Error::msg)? {
+                Some(release) => {
+                    println!("Installing version {}...", release.version);
+                    ovpn_otp_core::update::install(&release).map_err(anyhow::Error::msg)?;
+                    println!("Updated to version {}.", release.version);
+                }
+                None => println!("Already up to date."),
+            }
+            Ok(exit_code::OK)
+        }
         Cmd::Connect(args) => connect_cmd::cmd_connect(&path, args),
+        Cmd::Install(args) => install_cmd::cmd_install(args),
+        Cmd::Uninstall => install_cmd::cmd_uninstall(),
         Cmd::Code { code, stdin } => control::cmd_code(&path, code, stdin),
         Cmd::Wait {
             until,
@@ -600,6 +628,22 @@ fn run_doctor(path: &Path, doctor: &mut Doctor) {
                         },
                     );
                 }
+                if cfg!(windows) {
+                    if launch::elevated() {
+                        doctor.check(
+                            true,
+                            "rights",
+                            "ovpn-otp runs as administrator, so OpenVPN may add the network routes"
+                                .into(),
+                        );
+                    } else {
+                        doctor.check(
+                            false,
+                            "rights",
+                            "ovpn-otp does not run as administrator, and OpenVPN is started directly: adding the network routes will fail. Start ovpn-otp as administrator, or let the OpenVPN Interactive Service start OpenVPN (see the README).".into(),
+                        );
+                    }
+                }
             }
         },
         Err(e) => doctor.check(false, "openvpn", e.to_string()),
@@ -703,7 +747,8 @@ mod tests {
             vec!["login", "show", "--username", "alice"],
             vec!["login", "--username", "alice", "show"],
             vec!["logs", "--level", "loud"],
-            vec!["reconnect", "--timeout", "5"],
+            vec!["reconnect", "--elevate", "--background"],
+            vec!["connect", "--elevate", "--background"],
         ] {
             assert!(
                 parse(&args).is_err(),
