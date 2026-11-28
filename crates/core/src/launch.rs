@@ -232,10 +232,26 @@ pub fn elevated() -> bool {
 /// rights: on Windows any direct start does (only the interactive service does
 /// not), on Linux the `sudo`/`pkexec` prefix asks for them by itself.
 pub fn needs_admin(settings: &Settings) -> bool {
-    match OpenVpnLauncher::from_settings(settings) {
-        Ok(l) => matches!(l.mode, LaunchMode::Direct { .. }) && cfg!(windows),
-        Err(_) => cfg!(windows),
+    if !cfg!(windows) {
+        return false;
     }
+    let launch = settings.platform().launch.trim().to_ascii_lowercase();
+    if launch == "service" {
+        // The user said the service runs OpenVPN; a moment where its pipe is
+        // busy with another session does not change that.
+        return false;
+    }
+    match OpenVpnLauncher::from_settings(settings) {
+        Ok(l) => matches!(l.mode, LaunchMode::Direct { .. }),
+        Err(_) => true,
+    }
+}
+
+/// Keep the terminal's pipes out of the next child this process starts (see
+/// [`windows::make_stdio_uninheritable`]). Nothing to do off Windows.
+pub fn detach_stdio() {
+    #[cfg(windows)]
+    windows::make_stdio_uninheritable();
 }
 
 /// The advice for a connect that will fail for lack of rights, or an empty
@@ -493,9 +509,41 @@ mod windows {
         }
     }
 
+    /// Stop this process's own stdio handles from being inherited by the next
+    /// child it starts.
+    ///
+    /// A child is started with every inheritable handle of its parent, not
+    /// only the three stdio ones it is given. The terminal's pipes are such
+    /// handles (WSL marks them inheritable), and WSL waits for every process
+    /// that holds one. A detached session process would then keep `connect
+    /// --background` from returning for as long as the session runs. Clearing
+    /// the inherit flag on our stdio keeps the pipes out of the child.
+    pub fn make_stdio_uninheritable() {
+        use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::System::Console::GetStdHandle;
+        const STD_HANDLES: [u32; 3] = [
+            windows_sys::Win32::System::Console::STD_INPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_OUTPUT_HANDLE,
+            windows_sys::Win32::System::Console::STD_ERROR_HANDLE,
+        ];
+        unsafe {
+            for which in STD_HANDLES {
+                let handle = GetStdHandle(which);
+                if !handle.is_null() && handle != -1isize as _ {
+                    SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                }
+            }
+        }
+    }
+
     pub fn service_available() -> bool {
         // Opening and closing the pipe without writing does not start anything.
-        OpenOptions::new().read(true).write(true).open(PIPE).is_ok()
+        // When every pipe instance is busy (another session is connecting right
+        // now), the service is still there: that error means available too.
+        match OpenOptions::new().read(true).write(true).open(PIPE) {
+            Ok(_) => true,
+            Err(e) => e.raw_os_error() == Some(231), // ERROR_PIPE_BUSY
+        }
     }
 
     pub fn launch_service(req: &LaunchRequest) -> Result<Launched, LaunchError> {

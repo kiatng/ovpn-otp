@@ -194,6 +194,14 @@ fn connect_elevated(
         let code = code_from_args(args, digits)?;
         return connect_background(path, loaded, rt, &login, code, timeout, args.json);
     }
+    if !launch::needs_admin(&loaded.settings) {
+        // The OpenVPN interactive service runs OpenVPN with the rights it
+        // needs, so nothing here has to be elevated.
+        eprintln!("note: the OpenVPN interactive service runs the tunnel, so no elevation is needed; connecting right here.");
+        let login = get_login(loaded, args.username.clone(), args.password_stdin)?;
+        let code = code_from_args(args, digits)?;
+        return connect_background(path, loaded, rt, &login, code, timeout, args.json);
+    }
     // The window connects with its saved login: the password never passes
     // through another process, and --password-stdin could not reach it anyway.
     if args.password_stdin {
@@ -523,6 +531,9 @@ fn connect_background(
         .stdout(Stdio::null())
         .stderr(err_file);
     detach(&mut cmd);
+    // The child gets every inheritable handle this process holds; keep the
+    // terminal's pipes out of it, or WSL would wait for the whole session.
+    launch::detach_stdio();
     let started = Local::now();
     let mut child = cmd.spawn().context("cannot start the background session")?;
     {

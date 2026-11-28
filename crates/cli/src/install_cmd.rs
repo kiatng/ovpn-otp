@@ -117,6 +117,22 @@ fn run(cmd: &mut Command, what: &str) -> Result<String> {
     Ok(text)
 }
 
+/// Run a PowerShell script that ends with a marker when it truly worked.
+///
+/// PowerShell often exits 0 even when a command failed (a cancelled UAC
+/// prompt, a denied task registration), so the exit code alone proves
+/// nothing; the script's last word does.
+fn run_ps(script: &str, marker: &str, what: &str) -> Result<String> {
+    let text = run(
+        Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]),
+        what,
+    )?;
+    if !text.contains(marker) {
+        bail!("{what} did not complete (it said: {text})");
+    }
+    Ok(text)
+}
+
 /// Quote one value for a PowerShell single-quoted string.
 pub(crate) fn ps_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
@@ -192,36 +208,42 @@ Run this once in an administrator PowerShell:\
             bail!("no ovpn-otp-gui.exe next to this program; unpack the release archive first");
         }
         add_to_user_path(&dir)?;
-        make_shortcut(&dir, &gui)?;
+        make_shortcut(&dir, &gui, false)?;
         println!("Installed to {}", dir.display());
         for p in &copied {
             println!("  {}", p.display());
         }
-        println!(
-            "Start-menu entry \"ovpn-otp\" created; it starts the window with \
-administrator rights through the scheduled task."
-        );
+        println!("Start-menu entry \"ovpn-otp\" created.");
         println!("The CLI is on your PATH in new terminals.");
-        match ensure_task(false) {
-            Ok(()) => {}
-            Err(e) => {
-                println!();
-                println!("{TASK_HELP}  ({e})");
-                // One UAC prompt from here creates the task without a terminal.
-                print!("Asking Windows for administrator rights now? [Y/n] ");
-                std::io::stdout().flush().ok();
-                let mut answer = String::new();
-                let _ = std::io::stdin().read_line(&mut answer);
-                let answer = answer.trim().to_ascii_lowercase();
-                if answer.is_empty() || answer == "y" || answer == "yes" {
-                    match self_elevate(&dir.join("ovpn-otp.exe"), &["install", "--elevated-part"]) {
-                        Ok(()) => println!("The scheduled task was created."),
-                        Err(e) => bail!("{TASK_HELP}\nThe UAC prompt did not go through: {e}"),
-                    }
-                } else {
-                    println!("{TASK_HELP}");
+        let mut task_ok = ensure_task(false).is_ok();
+        if !task_ok {
+            println!();
+            println!("{TASK_HELP}");
+            // One UAC prompt from here creates the task without a terminal.
+            print!("Asking Windows for administrator rights now? [Y/n] ");
+            std::io::stdout().flush().ok();
+            let mut answer = String::new();
+            let _ = std::io::stdin().read_line(&mut answer);
+            let answer = answer.trim().to_ascii_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                match self_elevate(&dir.join("ovpn-otp.exe"), &["install", "--elevated-part"]) {
+                    Ok(()) => task_ok = true,
+                    Err(e) => println!("The UAC prompt did not go through: {e}"),
                 }
             }
+        }
+        if task_ok {
+            // The shortcut runs the task, which starts the window elevated.
+            make_shortcut(&dir, &gui, true)?;
+            println!(
+                "The Start-menu entry starts the window with administrator \
+rights through the scheduled task."
+            );
+        } else {
+            println!(
+                "Until then, the Start-menu entry starts the window normally; \
+the OpenVPN interactive service can still run the tunnel without it."
+            );
         }
         println!();
         println!("To connect from a script or an AI agent:");
@@ -236,6 +258,11 @@ administrator rights through the scheduled task."
     /// one UAC prompt that `install` asks for.
     fn install_elevated_part() -> Result<u8> {
         ensure_task(true)?;
+        let dir = install_dir()?;
+        let gui = dir.join("ovpn-otp-gui.exe");
+        if gui.is_file() {
+            make_shortcut(&dir, &gui, true)?;
+        }
         println!(
             "Scheduled task \"{APP_NAME}\" created: starts the window with administrator rights."
         );
@@ -254,15 +281,14 @@ administrator rights through the scheduled task."
             bail!("not running as administrator");
         }
         let script = format!(
-            "$a = New-ScheduledTaskAction -Execute {}; \
-             Register-ScheduledTask -TaskName {} -Action $a -RunLevel Highest -Force | Out-Null",
+            "$ErrorActionPreference = 'Stop'; \
+             $a = New-ScheduledTaskAction -Execute {}; \
+             Register-ScheduledTask -TaskName {} -Action $a -RunLevel Highest -Force | Out-Null; \
+             Write-Output 'TASK-OK'",
             ps_quote(&gui.display().to_string()),
             ps_quote(APP_NAME),
         );
-        run(
-            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]),
-            "creating the scheduled task",
-        )?;
+        run_ps(&script, "TASK-OK", "creating the scheduled task")?;
         Ok(())
     }
 
@@ -270,7 +296,7 @@ administrator rights through the scheduled task."
     fn task_points_at(gui: &Path) -> Result<bool> {
         let script = format!(
             "$t = Get-ScheduledTask -TaskName {} -ErrorAction SilentlyContinue; \
-             if ($t) {{ $t.Actions | ForEach-Object {{ $_.Execute }} }}",
+             if ($t) {{ ($t.Actions | ForEach-Object {{ $_.Execute }}) -join ';' }} else {{ 'NO-TASK' }}",
             ps_quote(APP_NAME),
         );
         let out = run(
@@ -278,9 +304,10 @@ administrator rights through the scheduled task."
             "reading the scheduled task",
         );
         match out {
-            Ok(text) => Ok(text
-                .lines()
-                .any(|l| l.trim().eq_ignore_ascii_case(&gui.display().to_string()))),
+            Ok(text) => Ok(!text.contains("NO-TASK")
+                && text
+                    .lines()
+                    .any(|l| l.trim().eq_ignore_ascii_case(&gui.display().to_string()))),
             Err(_) => Ok(false),
         }
     }
@@ -305,8 +332,10 @@ administrator rights through the scheduled task."
         Ok(())
     }
 
-    /// The Start-menu shortcut: runs the scheduled task, shows the app icon.
-    fn make_shortcut(dir: &Path, gui: &Path) -> Result<()> {
+    /// The Start-menu shortcut. With `via_task` it runs the scheduled task
+    /// (which starts the window elevated, and needs the task to exist);
+    /// otherwise it starts the window directly.
+    fn make_shortcut(dir: &Path, gui: &Path, via_task: bool) -> Result<()> {
         let start_menu = std::env::var_os("APPDATA")
             .map(PathBuf::from)
             .context("cannot find the roaming app-data folder (APPDATA)")?;
@@ -317,19 +346,40 @@ administrator rights through the scheduled task."
             .join("Programs");
         std::fs::create_dir_all(&programs).ok();
         let lnk = programs.join(format!("{APP_NAME}.lnk"));
+        let (target, arguments, description) = if via_task {
+            (
+                ps_quote(r"C:\Windows\System32\schtasks.exe"),
+                "'/run /tn \"ovpn-otp\"'".to_string(),
+                "ovpn-otp (runs with administrator rights)",
+            )
+        } else {
+            (
+                ps_quote(&gui.display().to_string()),
+                String::new(),
+                "ovpn-otp",
+            )
+        };
+        let arguments_line = if arguments.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " \
+             $s.Arguments = {arguments};"
+            )
+        };
         let script = format!(
             "$ws = New-Object -ComObject WScript.Shell; \
              $s = $ws.CreateShortcut({}); \
-             $s.TargetPath = {}; \
-             $s.Arguments = '/run /tn \"ovpn-otp\"'; \
+             $s.TargetPath = {};{arguments_line} \
              $s.WorkingDirectory = {}; \
              $s.IconLocation = {}; \
-             $s.Description = 'ovpn-otp (runs with administrator rights)'; \
+             $s.Description = {}; \
              $s.Save()",
             ps_quote(&lnk.display().to_string()),
-            ps_quote(r"C:\Windows\System32\schtasks.exe"),
+            target,
             ps_quote(&dir.display().to_string()),
             ps_quote(&gui.display().to_string()),
+            ps_quote(description),
         );
         run(
             Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]),
@@ -342,16 +392,30 @@ administrator rights through the scheduled task."
     fn self_elevate(exe: &Path, args: &[&str]) -> Result<()> {
         let arglist: Vec<String> = args.iter().map(|a| ps_quote(a)).collect();
         let script = format!(
-            "$p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; \
-             exit $p.ExitCode",
+            "$ErrorActionPreference = 'Stop'; \
+             try {{ \
+                 $p = Start-Process -FilePath {} -ArgumentList {} -Verb RunAs -Wait -PassThru; \
+                 Write-Output ('EXITCODE=' + $p.ExitCode) \
+             }} catch {{ \
+                 Write-Output ('FAILED=' + $_.Exception.Message) \
+             }}",
             ps_quote(&exe.display().to_string()),
             arglist.join(","),
         );
-        run(
+        let text = run(
             Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]),
             "asking Windows for administrator rights (UAC)",
         )?;
-        Ok(())
+        if let Some(code) = text.strip_prefix("EXITCODE=") {
+            if code.trim() == "0" {
+                return Ok(());
+            }
+            bail!("the elevated install ended with exit code {}", code.trim());
+        }
+        if let Some(rest) = text.strip_prefix("FAILED=") {
+            bail!("Windows refused or the UAC prompt was not accepted ({rest})");
+        }
+        bail!("the elevated install could not be watched (it said: {text})");
     }
 
     pub fn uninstall() -> Result<u8> {

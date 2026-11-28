@@ -28,7 +28,7 @@ toml.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 keyring = { workspace = true, features = ["windows-native"] }
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Console", "Win32_System_Threading"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 keyring = { workspace = true, features = ["async-secret-service", "async-io", "crypto-rust"] }
