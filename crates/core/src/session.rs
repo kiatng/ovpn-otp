@@ -462,6 +462,8 @@ struct Engine {
     drop_reason: Option<String>,
     /// OpenVPN is being stopped because a try failed in a way that retrying will not fix.
     end_failure: Option<Failure>,
+    /// The routes could not be added; the session is being ended for it.
+    route_error_failed: bool,
     /// Why OpenVPN said it was exiting by itself.
     exit_failure: Option<Failure>,
     stop_deadline: Option<Instant>,
@@ -519,6 +521,7 @@ impl Engine {
             stopping: false,
             drop_reason: None,
             end_failure: None,
+            route_error_failed: false,
             exit_failure: None,
             stop_deadline: None,
             fatal: None,
@@ -611,6 +614,7 @@ impl Engine {
         self.stopping = false;
         self.drop_reason = None;
         self.end_failure = None;
+        self.route_error_failed = false;
         self.exit_failure = None;
         self.stop_deadline = None;
         self.fatal = None;
@@ -1100,6 +1104,15 @@ impl Engine {
         {
             self.tls_established = true;
         }
+        // OpenVPN also reports a route failure only in the log, before it
+        // reaches CONNECTED; on Windows that message says the routes are lost.
+        if cfg!(windows)
+            && !self.route_error_failed
+            && (self.connected || self.last_state == "ADD_ROUTES")
+            && entry.message.contains("route add command failed")
+        {
+            self.fail_route_error();
+        }
         if let Some(reply) = mgmt::parse_push_reply(&entry.message) {
             self.emit(Event::Pushed(reply));
         }
@@ -1191,8 +1204,15 @@ impl Engine {
                 self.reached_auth = true;
                 self.sent_code = None;
                 self.progress_at = None;
-                if !self.opts.reach.host.trim().is_empty() {
-                    self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
+                if info.detail.eq_ignore_ascii_case("ROUTE_ERROR") {
+                    // The tunnel is up, but the routes are missing: end the
+                    // session as a failure instead of showing a connection
+                    // that cannot carry traffic.
+                    self.fail_route_error();
+                } else {
+                    if !self.opts.reach.host.trim().is_empty() {
+                        self.next_reach_at = Some(Instant::now() + Duration::from_secs(1));
+                    }
                 }
             }
             "RECONNECTING" => {
@@ -1224,6 +1244,27 @@ impl Engine {
             _ => {}
         }
         self.emit(Event::State { at: now(), info });
+    }
+
+    /// The tunnel is up, but the network routes could not be added: without
+    /// them nothing behind the VPN is reachable. End the session as a failure
+    /// that says what to do, instead of showing a connection that cannot work.
+    fn fail_route_error(&mut self) {
+        if self.route_error_failed {
+            return;
+        }
+        self.route_error_failed = true;
+        let why = if cfg!(windows) {
+            "The VPN connected, but Windows could not add the network routes the server sent, so nothing behind the VPN is reachable. Run ovpn-otp as administrator and connect again, or let the OpenVPN Interactive Service start OpenVPN (see the README)."
+        } else {
+            "The VPN connected, but the network routes could not be added, so nothing behind the VPN is reachable. Give openvpn the rights to change the network: see the README section \"Linux: let openvpn create the tunnel\"."
+        };
+        self.note(LogLevel::Error, why);
+        self.stopping = true;
+        self.end_failure = Some(Failure::new(FailureKind::Failed, why));
+        self.progress_at = None;
+        self.stop_deadline = Some(Instant::now() + STOP_TIMEOUT);
+        self.send("signal SIGTERM", Reply::Simple);
     }
 
     /// A working connection dropped.
@@ -1561,7 +1602,19 @@ fn redact_test_text(text: &mut String, password: &str, digits: u8) {
 fn redact_test_event(event: &mut Event, password: &str, digits: u8) {
     let clean = |s: &mut String| redact_test_text(s, password, digits);
     match event {
-        Event::Wire { text, .. } | Event::Note { text, .. } => clean(text),
+        // A state line holds no secret, and hiding its numbers would hide the
+        // one thing it is read for: `>STATE:...CONNECTED,SUCCESS,10.8.0.6,...`.
+        Event::Wire { text, .. } => {
+            let is_state = text
+                .trim_start()
+                .to_ascii_uppercase()
+                .starts_with(">STATE:")
+                || mgmt::parse_state(text.trim()).is_some();
+            if !is_state {
+                clean(text);
+            }
+        }
+        Event::Note { text, .. } => clean(text),
         Event::Log(entry) => clean(&mut entry.message),
         Event::State { info, .. } => {
             clean(&mut info.detail);
@@ -1763,6 +1816,22 @@ mod tests {
             panic!("expected wire")
         };
         assert!(!text.contains("secret"));
+        // A state line holds no secret, so it is shown as OpenVPN wrote it.
+        for line in [
+            ">STATE:1700000003,CONNECTED,SUCCESS,10.8.0.6,203.0.113.5,8443",
+            "1700000003,CONNECTED,SUCCESS,10.8.0.6,203.0.113.5,8443",
+        ] {
+            let mut state = Event::Wire {
+                at: now(),
+                dir: Direction::In,
+                text: line.into(),
+            };
+            redact_test_event(&mut state, "871234", 6);
+            let Event::Wire { text, .. } = state else {
+                panic!("expected wire")
+            };
+            assert_eq!(text, line);
+        }
         let mut challenge = "SCRV1:encoded-password:encoded-code".to_string();
         redact_test_text(&mut challenge, "different", 6);
         assert!(!challenge.contains("encoded-password"));

@@ -265,6 +265,36 @@ fn rejected_login_asks_for_a_new_code() {
 }
 
 #[test]
+fn route_error_ends_as_a_failure_that_says_what_to_do() {
+    let fake = Fake::new("pw123456").with_plan(&[Outcome::RouteError]);
+    let h = session::start(options(Some("123456"), "pw"), launcher(&fake));
+    let mut seen = Vec::new();
+    let ev = wait_for(&h, &mut seen, "end", is_ended);
+    let Event::Ended { reason } = ev else {
+        unreachable!()
+    };
+    let EndReason::Failed(f) = reason else {
+        panic!("expected a failure, got {reason:?}")
+    };
+    assert_eq!(f.kind, FailureKind::Failed);
+    assert!(f.message.contains("routes"), "{}", f.message);
+    if cfg!(windows) {
+        assert!(f.message.contains("administrator"), "{}", f.message);
+    }
+    // The picture the window and `status` show is Failed, not Connected.
+    let mut snap = Snapshot::default();
+    for e in &seen {
+        snap.apply(e);
+    }
+    assert_eq!(snap.phase, Phase::Failed);
+    assert!(snap
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("routes"));
+}
+
+#[test]
 fn link_drop_waits_backoff_and_asks_for_fresh_code() {
     let fake = Fake::new("pw123456");
     let h = session::start(options(Some("123456"), "pw"), launcher(&fake));

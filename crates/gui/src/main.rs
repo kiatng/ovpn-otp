@@ -41,8 +41,9 @@ use chrono::Local;
 use eframe::egui::{self, Color32, RichText};
 
 use ovpn_otp_core::credentials::{CredentialStore, KeyringStore, Login, Secret};
+use ovpn_otp_core::launch;
 use ovpn_otp_core::mgmt::LogLevel;
-use ovpn_otp_core::runtime::{Recorder, RuntimeDir, StatusFile, Using};
+use ovpn_otp_core::runtime::{ConnectRequest, GuiLock, Recorder, RuntimeDir, StatusFile, Using};
 use ovpn_otp_core::session::{
     validate_code, Direction, Event, Failure, FailureKind, SessionHandle,
 };
@@ -81,6 +82,34 @@ fn main() -> eframe::Result {
             );
         }
     }
+    // One window at a time: two would fight over the routes and the tunnel.
+    // A second start shows the window that already runs, and ends here.
+    let runtime = RuntimeDir::open();
+    let gui_lock = match &runtime {
+        Ok(rt) => match GuiLock::acquire(rt) {
+            Ok(Ok(lock)) => Some(lock),
+            Ok(Err(other)) => {
+                let _ = rt.request_show();
+                eprintln!(
+                    "ovpn-otp is already running (process {}). Showing it instead.",
+                    if other.pid != 0 {
+                        other.pid.to_string()
+                    } else {
+                        "unknown".into()
+                    }
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("warning: cannot check for a running window ({e}).");
+                None
+            }
+        },
+        Err(e) => {
+            eprintln!("warning: cannot create the runtime folder ({e}).");
+            None
+        }
+    };
     let path = settings::settings_path(requested.as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -92,7 +121,7 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "ovpn-otp",
         options,
-        Box::new(move |_cc| Ok(Box::new(App::new(path)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(path, gui_lock)))),
     )
 }
 
@@ -146,6 +175,101 @@ struct Other {
     live: bool,
 }
 
+/// The system-tray icon and its menu (Windows). Dropping it removes the icon.
+#[cfg(windows)]
+struct Tray {
+    _icon: tray_icon::TrayIcon,
+    show: tray_icon::menu::MenuItem,
+    connect: tray_icon::menu::MenuItem,
+    disconnect: tray_icon::menu::MenuItem,
+    quit: tray_icon::menu::MenuItem,
+}
+
+/// What was clicked in the tray menu.
+#[cfg(windows)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TrayAction {
+    Show,
+    Connect,
+    Disconnect,
+    Quit,
+}
+
+#[cfg(windows)]
+impl Tray {
+    fn new() -> Option<Tray> {
+        let show = tray_icon::menu::MenuItem::with_id("show", "Show", true, None);
+        let connect = tray_icon::menu::MenuItem::with_id("connect", "Connect", true, None);
+        let disconnect = tray_icon::menu::MenuItem::with_id("disconnect", "Disconnect", true, None);
+        let quit = tray_icon::menu::MenuItem::with_id("quit", "Quit", true, None);
+        let menu = tray_icon::menu::Menu::new();
+        for item in [&show, &connect, &disconnect, &quit] {
+            menu.append(item).ok()?;
+        }
+        let icon = tray_icon::TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("ovpn-otp")
+            .with_icon(tray_icon_icon()?)
+            .build()
+            .ok()?;
+        Some(Tray {
+            _icon: icon,
+            show,
+            connect,
+            disconnect,
+            quit,
+        })
+    }
+
+    /// The one menu choice clicked since the last look, if any.
+    fn clicked(&self) -> Option<TrayAction> {
+        use tray_icon::menu::MenuEvent;
+        let mut action = None;
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            action = if ev.id() == self.show.id() {
+                Some(TrayAction::Show)
+            } else if ev.id() == self.connect.id() {
+                Some(TrayAction::Connect)
+            } else if ev.id() == self.disconnect.id() {
+                Some(TrayAction::Disconnect)
+            } else if ev.id() == self.quit.id() {
+                Some(TrayAction::Quit)
+            } else {
+                action
+            };
+        }
+        action
+    }
+}
+
+/// The tray picture: a green circle with a lighter middle, painted by hand so
+/// no icon file has to travel with the program.
+#[cfg(windows)]
+fn tray_icon_icon() -> Option<tray_icon::Icon> {
+    const W: u32 = 32;
+    const H: u32 = 32;
+    let mut rgba = vec![0u8; (W * H * 4) as usize];
+    for y in 0..H {
+        for x in 0..W {
+            let dx = x as f32 - 15.5;
+            let dy = y as f32 - 15.5;
+            let r = (dx * dx + dy * dy).sqrt();
+            let i = ((y * W + x) * 4) as usize;
+            let (red, green, blue, alpha) = if r <= 5.5 {
+                (210, 240, 220, 255)
+            } else if r <= 13.5 {
+                (60, 170, 90, 255)
+            } else if r <= 15.5 {
+                (40, 120, 62, 255)
+            } else {
+                (0, 0, 0, 0)
+            };
+            rgba[i..i + 4].copy_from_slice(&[red, green, blue, alpha]);
+        }
+    }
+    tray_icon::Icon::from_rgba(rgba, W, H).ok()
+}
+
 const GREEN: Color32 = Color32::from_rgb(60, 170, 90);
 const BLUE: Color32 = Color32::from_rgb(80, 140, 220);
 const AMBER: Color32 = Color32::from_rgb(230, 160, 40);
@@ -185,6 +309,16 @@ struct App {
     update_installing: bool,
     loaded: LoadedSettings,
     load_error: Option<String>,
+    /// The single-instance lock, held for as long as this window runs.
+    gui_lock: Option<GuiLock>,
+    /// Why a connect would fail for lack of rights, before one is tried.
+    elevation_note: Option<String>,
+    /// Closing the window hides it (to the tray); only Quit ends the app.
+    quitting: bool,
+    /// Whether the "keeps running in the tray" note was shown once.
+    tray_note: bool,
+    #[cfg(windows)]
+    tray: Option<Tray>,
     username: String,
     password: String,
     show_password: bool,
@@ -218,7 +352,7 @@ struct App {
 }
 
 impl App {
-    fn new(path: PathBuf) -> App {
+    fn new(path: PathBuf, gui_lock: Option<GuiLock>) -> App {
         let (loaded, load_error) = match settings::load(&path) {
             Ok(l) => (l, None),
             Err(e) => (
@@ -230,6 +364,10 @@ impl App {
             ),
         };
         let shot = shot::Shot::from_env();
+        let elevation_note = {
+            let advice = launch::rights_advice(&loaded.settings);
+            (!advice.is_empty()).then_some(advice)
+        };
         let mut app = App {
             update_rx: None,
             update_available: None,
@@ -240,6 +378,12 @@ impl App {
             verb_edit: 3,
             loaded,
             load_error,
+            gui_lock,
+            elevation_note,
+            quitting: false,
+            tray_note: false,
+            #[cfg(windows)]
+            tray: Tray::new(),
             username: String::new(),
             password: String::new(),
             show_password: false,
@@ -441,6 +585,25 @@ impl App {
     /// Take in session events. Called every frame and while hidden.
     fn pump(&mut self, ctx: &egui::Context) {
         ctx.request_repaint_after(Duration::from_millis(500));
+        // A second start asked for the window to come back.
+        if self
+            .runtime
+            .as_ref()
+            .is_some_and(|rt| rt.take_show_request())
+        {
+            self.show_window(ctx);
+        }
+        // A CLI connect handed over with `--elevate` waits for this window to
+        // run the session, when none runs yet.
+        if !self.is_active() {
+            if let Some(req) = self
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.take_connect_request())
+            {
+                self.run_requested_connect(ctx, req);
+            }
+        }
         if self.session.is_none() {
             self.watch_other(ctx);
             return;
@@ -482,12 +645,78 @@ impl App {
     /// Bring the window to the front: the server waits for a code.
     fn ask_for_code(&mut self, ctx: &egui::Context) {
         self.focus_code = true;
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+        self.show_window(ctx);
         ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
             egui::UserAttentionType::Critical,
         ));
+    }
+
+    /// Show the window again, from the tray or a second start.
+    fn show_window(&self, ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    /// Run the connect that `ovpn-otp connect --elevate` handed over: the
+    /// saved login plus the code it carried, as if they were typed here.
+    fn run_requested_connect(&mut self, ctx: &egui::Context, req: ConnectRequest) {
+        let name = self.loaded.settings.name.clone();
+        let login = match KeyringStore.load(&name) {
+            Ok(Some(l)) => l,
+            Ok(None) => {
+                self.fail_requested_connect(
+                    ctx,
+                    format!(
+                        "the elevated window connects with its saved login, and there is none for '{name}'. Run `ovpn-otp login` first."
+                    ),
+                );
+                return;
+            }
+            Err(e) => {
+                self.fail_requested_connect(
+                    ctx,
+                    format!("cannot read the saved login for '{name}': {e}"),
+                );
+                return;
+            }
+        };
+        if !req.username.trim().is_empty() && req.username.trim() != login.username {
+            self.fail_requested_connect(
+                ctx,
+                format!(
+                    "the connect asked for user {}, but the saved login for '{name}' is user {}.",
+                    req.username.trim(),
+                    login.username
+                ),
+            );
+            return;
+        }
+        if let Err(e) = validate_code(&req.code, self.digits()) {
+            self.fail_requested_connect(ctx, format!("--code-stdin: {e}"));
+            return;
+        }
+        self.username = login.username;
+        self.password = login.password.expose().to_string();
+        self.code = req.code;
+        self.connect();
+        self.code.clear();
+    }
+
+    /// A handed-over connect could not run: say so here, and in the status
+    /// file the waiting `ovpn-otp connect --elevate` reads.
+    fn fail_requested_connect(&mut self, ctx: &egui::Context, why: String) {
+        self.message = Some((true, why.clone()));
+        self.show_window(ctx);
+        if let Some(rt) = &self.runtime {
+            let mut snap = Snapshot::default();
+            snap.phase = Phase::Failed;
+            snap.failure = Some(FailureKind::Failed);
+            snap.last_error = Some(why);
+            snap.phase_since = Some(chrono::Local::now());
+            let mut rec = Recorder::new(rt.clone(), self.using.clone());
+            rec.write_status(&snap, false, true);
+        }
     }
 
     /// Look, twice a second, for a session that another program runs, and
@@ -851,6 +1080,9 @@ impl App {
         ui.add_space(6.0);
         if self.section.is_none() {
             self.banner(ui);
+            if let Some(note) = &self.elevation_note {
+                ui.label(RichText::new(note).small().color(AMBER));
+            }
             ui.add_space(6.0);
             self.using_rows(ui);
         }
@@ -1099,11 +1331,6 @@ impl App {
                 ui.text_edit_singleline(&mut e.name)
                     .on_hover_text("The saved login is stored under this name.");
                 ui.end_row();
-                ui.label("Profile (.ovpn)");
-                let profile = end_of_path(&e.profile.path, (ui.available_width() / 7.5) as usize);
-                ui.add(egui::Label::new(profile).truncate())
-                    .on_hover_text(format!("{}\nChoose a different profile on Connect.", e.profile.path));
-                ui.end_row();
                 ui.label("Use another server");
                 ui.add(egui::TextEdit::singleline(&mut e.profile.remote).hint_text("host:port, empty = use the profile"));
                 ui.end_row();
@@ -1146,7 +1373,38 @@ impl App {
                 ui.end_row();
                 let plat = if cfg!(windows) { &mut e.openvpn.windows } else { &mut e.openvpn.linux };
                 ui.label("openvpn program");
-                ui.add(egui::TextEdit::singleline(&mut plat.path).hint_text("empty = find it"));
+                // Click to pick the program in a file dialog; empty means
+                // OpenVPN is found automatically.
+                let chosen = plat.path.clone();
+                let shown = if chosen.is_empty() {
+                    "found automatically (click to choose)".to_string()
+                } else {
+                    end_of_path(&chosen, (ui.available_width() / 7.5) as usize)
+                };
+                let pick = ui
+                    .add(
+                        egui::Label::new(RichText::new(shown).monospace().underline())
+                            .truncate()
+                            .sense(egui::Sense::click()),
+                    )
+                    .on_hover_cursor(egui::CursorIcon::PointingHand)
+                    .on_hover_text(if chosen.is_empty() {
+                        "Click to look for the openvpn program in a file dialog.".to_string()
+                    } else {
+                        format!("{chosen}\nClick to choose another one.")
+                    });
+                if pick.clicked() {
+                    let mut dialog = rfd::FileDialog::new();
+                    if chosen.is_empty() {
+                        dialog = dialog.set_directory(std::env::var_os("ProgramFiles").map(PathBuf::from).unwrap_or_default());
+                    }
+                    if let Some(path) = dialog.pick_file() {
+                        plat.path = path.display().to_string();
+                    }
+                }
+                if !chosen.is_empty() && ui.small_button("use automatic").clicked() {
+                    plat.path.clear();
+                }
                 ui.end_row();
                 if cfg!(windows) {
                     ui.label("Start OpenVPN via");
@@ -1291,6 +1549,44 @@ impl eframe::App for App {
         if std::mem::take(&mut self.connect_at_start) {
             self.connect();
         }
+        // A choice made in the tray menu.
+        #[cfg(windows)]
+        {
+            let action = self.tray.as_ref().and_then(|t| t.clicked());
+            match action {
+                Some(TrayAction::Show) => self.show_window(ctx),
+                Some(TrayAction::Connect) => {
+                    self.show_window(ctx);
+                    self.connect();
+                }
+                Some(TrayAction::Disconnect) => self.disconnect(),
+                Some(TrayAction::Quit) => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+                None => {}
+            }
+        }
+        // Closing the window leaves the app running in the tray; only Quit
+        // (in the tray menu) ends it. Where there is no tray, it ends here.
+        if ctx.input(|i| i.viewport().close_requested()) {
+            #[cfg(windows)]
+            let have_tray = self.tray.is_some();
+            #[cfg(not(windows))]
+            let have_tray = false;
+            let hide = cfg!(windows) && have_tray && !self.quitting;
+            if hide {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                if !self.tray_note {
+                    self.tray_note = true;
+                    self.message = Some((
+                        false,
+                        "ovpn-otp keeps running here; open it again from its icon in the notification area. Quit in that menu ends it.".into(),
+                    ));
+                }
+            }
+        }
         self.pump(ctx);
         if let Some(result) = self.update_rx.as_ref().and_then(|rx| rx.try_recv().ok()) {
             self.update_rx = None;
@@ -1363,6 +1659,9 @@ impl Drop for App {
             run.recorder.write_status(&self.snap, false, true);
             let _ = std::fs::remove_file(&run.config_path);
         }
+        // The single-instance lock goes last, so another start waits until
+        // the session is cleaned up.
+        drop(self.gui_lock.take());
     }
 }
 

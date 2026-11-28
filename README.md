@@ -38,10 +38,13 @@ Because the real work is done by OpenVPN, your connection is exactly as secure a
 
 1. Install the **OpenVPN community client**, version 2.6 or newer, from <https://openvpn.net/community-downloads/> with the default options. The defaults include the "OpenVPN Interactive Service", which lets ovpn-otp start OpenVPN without admin rights. (OpenVPN Connect, the other OpenVPN app, cannot be used: it has no way for another program to drive it.)
 2. Make sure your Windows user is in the **OpenVPN Administrators** group. The installer adds the user who ran it; to add another user, open *Computer Management → Local Users and Groups → Groups → OpenVPN Administrators*, add the user, then sign out and in again. Members of this group may run their own VPN profiles through the service.
-3. Download `ovpn-otp-<version>-x86_64-pc-windows-msvc.zip` from the [releases page](https://github.com/kiatng/ovpn-otp/releases), unzip it anywhere, and start `ovpn-otp-gui.exe`.
+3. Download `ovpn-otp-<version>-x86_64-pc-windows-msvc.zip` from the [releases page](https://github.com/kiatng/ovpn-otp/releases), unzip it anywhere, and run `ovpn-otp install` from that folder (in a terminal; accept the one administrator prompt). This puts the programs in `%LOCALAPPDATA%\Programs\ovpn-otp`, puts `ovpn-otp` on your PATH, and adds a **Start-menu entry** that starts the window with administrator rights, so adding the network routes works without asking again. `ovpn-otp uninstall` takes it back.
+4. Start **ovpn-otp** from the Start menu (or `ovpn-otp-gui.exe` directly).
+
+Closing the window leaves ovpn-otp running in the notification area (the chevron at the right end of the taskbar). Its menu has Show, Connect, Disconnect and Quit; only Quit ends the program. A second `ovpn-otp-gui` start shows the window that already runs instead of a second one, because two instances would fight over the routes and the tunnel.
 
 > [!TIP]
-> ovpn-otp can also run an `openvpn.exe` (2.6 or newer) that came with another program. Point `openvpn.windows.path` at it and set `openvpn.windows.launch` to `"direct"`. OpenVPN then needs admin rights to create the tunnel, so start ovpn-otp from an administrator window.
+> ovpn-otp can also run an `openvpn.exe` (2.6 or newer) that came with another program. Point `openvpn.windows.path` at it and set `openvpn.windows.launch` to `"direct"`. OpenVPN then needs admin rights to create the tunnel, so start ovpn-otp from an administrator window, or use the Start-menu entry that `ovpn-otp install` creates (it always runs elevated).
 
 ### Linux (Arch, Omarchy, Debian, Ubuntu, ...)
 
@@ -52,12 +55,7 @@ Because the real work is done by OpenVPN, your connection is exactly as secure a
    sudo apt install openvpn      # Debian, Ubuntu
    ```
 
-2. Download `ovpn-otp-<version>-x86_64-unknown-linux-gnu.tar.gz` from the [releases page](https://github.com/kiatng/ovpn-otp/releases) and put the two programs on your path:
-
-   ```sh
-   tar xzf ovpn-otp-*-x86_64-unknown-linux-gnu.tar.gz
-   install -m 755 ovpn-otp-*/ovpn-otp ovpn-otp-*/ovpn-otp-gui ~/.local/bin/
-   ```
+2. Download `ovpn-otp-<version>-x86_64-unknown-linux-gnu.tar.gz` from the [releases page](https://github.com/kiatng/ovpn-otp/releases) and unpack it, then run `ovpn-otp install`: it copies the two programs to `~/.local/bin` and writes a `.desktop` entry, so the app launcher finds the window. (By hand instead: `install -m 755 ovpn-otp-*/ovpn-otp ovpn-otp-*/ovpn-otp-gui ~/.local/bin/`.)
 
 3. Give OpenVPN the right to create the tunnel, as described in [Linux: let openvpn create the tunnel](#linux-let-openvpn-create-the-tunnel). **Do not run the window itself as root**; only OpenVPN needs the extra rights.
 
@@ -119,12 +117,12 @@ The window is small on purpose: about 420 by 290 points. The **Connect** view an
 
 Choose **Details**, **Log**, **Wire** or **Settings** at the top to open that view. Choose **Connect** to return to the connection.
 
-| Part | What it shows |
+| | |
 | --- | --- |
 | Details | Bytes received and sent with the speed, how long ago data last arrived (a number that keeps growing means the link has gone quiet), the reach check, routes, DNS and OpenVPN version. |
 | Log | The OpenVPN log and messages from ovpn-otp, with a filter for warnings and errors. |
 | Wire | Every line exchanged with OpenVPN on the management interface. Passwords, codes and session tokens show as `********`. |
-| Settings | The settings for this machine, and **Copy diagnostics**, which puts a troubleshooting report on the clipboard: versions, status, settings, timeline, log and wire transcript. Your password never appears in it, and your user name is replaced with `<user>`. |
+| Settings | The settings for this machine that no other view holds (connection name, keep-alive, checks, where OpenVPN is), and **Copy diagnostics**, which puts a troubleshooting report on the clipboard: versions, status, settings, timeline, log and wire transcript. Your password never appears in it, and your user name is replaced with `<user>`. |
 
 The window also shows a session that `ovpn-otp connect` started in a terminal. The banner then says "Started from the command line", and **Disconnect** and the code box work on that session.
 
@@ -248,7 +246,7 @@ Both give OpenVPN the same two options, `data-ciphers AES-256-GCM:AES-128-CBC` a
 
 | Command | What it does |
 | --- | --- |
-| `ovpn-otp connect` | Connect and stay connected until Ctrl+C. Asks for the code, or takes it with `--code-stdin` or `--code 123456`. With `--background` it starts the session as its own process and returns when the tunnel is up or the connect has failed. |
+| `ovpn-otp connect` | Connect and stay connected until Ctrl+C. Asks for the code, or takes it with `--code-stdin` or `--code 123456`. With `--background` it starts the session as its own process and returns when the tunnel is up or the connect has failed. With `--elevate` (Windows) it runs the session in the elevated desktop window instead, started for you when it is not running. |
 | `ovpn-otp disconnect` | Stop the running session. |
 | `ovpn-otp reconnect` | Stop the running session, if there is one, and connect again. Takes the same options as `connect`. |
 | `ovpn-otp status` | Show the state, and the profile, server and user name in use. While a session runs, also the address, traffic, last data, check and routes. |
@@ -258,6 +256,7 @@ Both give OpenVPN the same two options, `data-ciphers AES-256-GCM:AES-128-CBC` a
 | `ovpn-otp profile show` / `set FILE` / `list` | Show the profile in use and the servers in it, use another `.ovpn` file, or list the `.ovpn` files next to the settings file and in the folder where OpenVPN keeps profiles. |
 | `ovpn-otp config show` / `get KEY` / `set KEY VALUE` / `unset KEY` / `keys` / `path` / `edit` / `init` | Print the settings, read or change one by name, put one back to the default, list every setting with what it does, show where the settings file is, open it in your editor, or create it for a profile. |
 | `ovpn-otp login set` / `show` / `clear` | Save the user name and password in the credential store, show the saved user name (never the password), or remove the saved login. `ovpn-otp login` alone saves, and `ovpn-otp logout` removes. |
+| `ovpn-otp install` / `uninstall` | Put the programs where the system finds them (see [Install](#install)), and take them back. |
 | `ovpn-otp doctor` | Check the settings, the extra options, the profile, OpenVPN, the privileges and the saved login. |
 | `ovpn-otp diagnostics` | Print the troubleshooting report, with secrets removed. |
 
@@ -343,6 +342,18 @@ Notice what the script did **not** have to do: it never watched the output for a
 
 > [!WARNING]
 > Anything written as an option, such as the code in `--code 123456` or `ovpn-otp code 123456`, can be seen by other users of the machine in the process list while the command runs. Send the code on standard input instead, with `--code-stdin` or `ovpn-otp code --stdin`, as the examples here do. The password can only be sent on standard input.
+
+On Windows, adding the network routes needs administrator rights. When the OpenVPN Interactive Service runs the tunnel (the usual install), no shell needs them. Otherwise `ovpn-otp connect` warns before it tries, and a connect that cannot add the routes ends with a reason that says to run as administrator. From a normal shell, `ovpn-otp connect --elevate` runs the session in the desktop window with the rights it needs — started for you through the scheduled task that `ovpn-otp install` creates, so a script or an AI agent never has to type an administrator password:
+
+```sh
+# Windows, from an ordinary shell (or WSL, calling ovpn-otp.exe):
+# the login must be saved once (ovpn-otp login); the code goes on stdin.
+printf '%s\n' "$CODE" | ovpn-otp connect --elevate --code-stdin
+ovpn-otp status --json       # where things stand, at any time
+ovpn-otp disconnect
+```
+
+`--elevate` starts the window when it is not running, hands over the code, and waits until the tunnel is up (exit code 0), the connect failed (the exit code says why), or the session waits for a fresh code (exit code 6; send one with `ovpn-otp code --stdin`). The password never passes through the calling shell: the window connects with its saved login.
 
 ### Exit codes
 
@@ -473,6 +484,7 @@ Start with `ovpn-otp doctor`, which checks each piece in turn. Then open **Log**
 | "sudo wants a password" (Linux) | Follow [Linux: let openvpn create the tunnel](#linux-let-openvpn-create-the-tunnel). |
 | "Cannot open TUN" or "Operation not permitted" | OpenVPN has no network rights; see the same section. |
 | "Login rejected", or "The server rejected the login" | Check the code first: wait for a new code in your app and try again. If it keeps failing, re-enter your password (tick **Show** to check it) and save it again. |
+| "The VPN connected, but Windows could not add the network routes" | OpenVPN ran without the rights to change the network table. Run ovpn-otp as administrator (the Start-menu entry that `ovpn-otp install` creates always does), or let the OpenVPN Interactive Service start OpenVPN (the usual install, see [Install](#install)). `ovpn-otp doctor` says which way OpenVPN starts and whether the rights are there. |
 | "The server ... closed the connection during login and gave no reason" | The server hung up without explaining why. If OpenVPN did not report a completed secure channel, check that you selected the profile downloaded for this user and ask your VPN administrator to check the client certificate and server logs. If the secure channel was established, wait for the next code and check the password; the logs may also point to a cipher mismatch. |
 | "The server ... and OpenVPN have no encryption cipher in common" | The server uses a cipher that OpenVPN did not offer. Add it with `extra_options`, for example `"data-ciphers AES-256-GCM:AES-128-GCM:AES-128-CBC"`, with the cipher your VPN administrator names in place of the last one. |
 | "Could not reach the VPN server" | Check your network connection, then the server address and port in the profile (`ovpn-otp profile show`). The message includes what OpenVPN said, such as "Connection timed out". |
@@ -492,7 +504,7 @@ When you ask for help, paste the output of **Copy diagnostics** or `ovpn-otp dia
 ## Security and privacy
 
 - **Your password** is kept only in the OS credential store and in memory while connecting. It is never written to a file or a log; the management transcript shows `********` instead.
-- **Your code** is used once and never stored. A code given with `ovpn-otp code` passes through a file that only you can read, and the session deletes that file as soon as it has read it. A code written as an option (`--code 123456`) shows in the process list while the command runs, so prefer standard input.
+- **Your code** is used once and never stored. A code given with `ovpn-otp code` or `connect --code-stdin` passes through a file that only you can read, and the session deletes that file as soon as it has read it. A code handed to the window with `connect --elevate` passes the same way. A code written as an option (`--code 123456`) shows in the process list while the command runs, so prefer standard input.
 - **Your authenticator secret** is never asked for, stored or used. The code always comes from your authenticator app.
 - **The management interface** listens only on `127.0.0.1` and is protected by a random password that changes every time OpenVPN starts. That password reaches OpenVPN through a private file (Linux) or the interactive service (Windows), and the file is deleted when the session ends.
 - **The private copy of your profile** is readable only by you and is deleted when the session ends.
@@ -540,7 +552,7 @@ The integration test builds a throwaway certificate authority, starts an OpenVPN
 
 Two more servers in that test play the failures that are hard to see otherwise. The first accepts only the cipher AES-128-CBC, as older firewalls do. The test first shows that plain OpenVPN with a profile that says `cipher AES-128-CBC` is refused by it right after the TLS handshake, and then that ovpn-otp connects with the same profile. The second server closes the connection in the middle of the login without an answer, and the test checks that ovpn-otp ends with `server_reset` and exit code 4 instead of asking for another code.
 
-Not done yet, and welcome as contributions: macOS support and a tray icon.
+Not done yet, and welcome as contributions: macOS support, and a tray icon on Linux (Windows already has one).
 
 ## License
 
