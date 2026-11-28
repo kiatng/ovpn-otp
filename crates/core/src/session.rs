@@ -530,16 +530,6 @@ impl Engine {
     }
 
     fn emit(&self, ev: Event) {
-        #[cfg(feature = "diagnostic-test")]
-        let ev = {
-            let mut ev = ev;
-            redact_test_event(
-                &mut ev,
-                self.opts.login.password.expose(),
-                self.opts.code_digits,
-            );
-            ev
-        };
         let _ = self.events.send(ev);
     }
 
@@ -1563,94 +1553,6 @@ fn spawn_reader(stream: TcpStream, gen: u64, tx: Sender<Input>) {
     });
 }
 
-// The separate diagnostic build must not persist credentials, even if an
-// unexpected OpenVPN message echoes them. Mask digit runs long enough to hold
-// a code as well, because a code can have been discarded before a log arrives.
-#[cfg(feature = "diagnostic-test")]
-fn redact_test_text(text: &mut String, password: &str, digits: u8) {
-    let lower = text.to_ascii_lowercase();
-    if lower.contains("auth-token") || lower.contains("scrv1:") {
-        *text = "******** (authentication data hidden)".into();
-        return;
-    }
-    if !password.is_empty() {
-        *text = text.replace(password, "********");
-    }
-    let mut output = String::new();
-    let mut run = String::new();
-    let flush = |output: &mut String, run: &mut String| {
-        if run.len() >= usize::from(digits).max(1) {
-            output.push_str("********");
-        } else {
-            output.push_str(run);
-        }
-        run.clear();
-    };
-    for c in text.chars() {
-        if c.is_ascii_digit() {
-            run.push(c);
-        } else {
-            flush(&mut output, &mut run);
-            output.push(c);
-        }
-    }
-    flush(&mut output, &mut run);
-    *text = output;
-}
-
-#[cfg(feature = "diagnostic-test")]
-fn redact_test_event(event: &mut Event, password: &str, digits: u8) {
-    let clean = |s: &mut String| redact_test_text(s, password, digits);
-    match event {
-        // A state line holds no secret, and hiding its numbers would hide the
-        // one thing it is read for: `>STATE:...CONNECTED,SUCCESS,10.8.0.6,...`.
-        Event::Wire { text, .. } => {
-            let is_state = text
-                .trim_start()
-                .to_ascii_uppercase()
-                .starts_with(">STATE:")
-                || mgmt::parse_state(text.trim()).is_some();
-            if !is_state {
-                clean(text);
-            }
-        }
-        Event::Note { text, .. } => clean(text),
-        Event::Log(entry) => clean(&mut entry.message),
-        Event::State { info, .. } => {
-            clean(&mut info.detail);
-            clean(&mut info.local_ip);
-            clean(&mut info.remote_ip);
-            clean(&mut info.remote_port);
-        }
-        Event::AuthFailed { reason } | Event::Reconnecting { reason, .. } => clean(reason),
-        Event::ConnectFailed { failure, .. } => clean(&mut failure.message),
-        Event::Ended { reason } => match reason {
-            EndReason::Dropped(s) => clean(s),
-            EndReason::Failed(f) => clean(&mut f.message),
-            EndReason::Disconnected => {}
-        },
-        Event::Version(s) => clean(s),
-        Event::Pushed(p) => {
-            for s in &mut p.routes {
-                clean(s);
-            }
-            for s in &mut p.dns {
-                clean(s);
-            }
-            if let Some(s) = &mut p.ifconfig {
-                clean(s);
-            }
-        }
-        Event::Reach(r) => {
-            clean(&mut r.target);
-            if let Some(s) = &mut r.error {
-                clean(s);
-            }
-        }
-        _ => {}
-    }
-}
-
 /// Hide secrets in a command before showing it.
 pub fn redact_outgoing(cmd: &str) -> String {
     let lower = cmd.trim_start().to_ascii_lowercase();
@@ -1789,55 +1691,6 @@ mod tests {
         let secs: Vec<u64> = (1..=6).map(|a| backoff(&ka, a).as_secs()).collect();
         assert_eq!(secs, vec![2, 4, 8, 16, 30, 30]);
         assert_eq!(backoff(&ka, 200).as_secs(), 30);
-    }
-
-    #[cfg(feature = "diagnostic-test")]
-    #[test]
-    fn diagnostic_events_remove_password_and_digit_codes() {
-        let mut event = Event::Log(LogEntry {
-            time: 1,
-            level: LogLevel::Info,
-            message: "received passWord-123 and 871234".into(),
-        });
-        redact_test_event(&mut event, "passWord-123", 6);
-        let Event::Log(entry) = event else {
-            panic!("expected log")
-        };
-        assert!(!entry.message.contains("passWord-123"));
-        assert!(!entry.message.contains("871234"));
-        assert!(entry.message.contains("********"));
-        let mut wire = Event::Wire {
-            at: now(),
-            dir: Direction::In,
-            text: ">PASSWORD:Auth-Token:secret".into(),
-        };
-        redact_test_event(&mut wire, "secret", 6);
-        let Event::Wire { text, .. } = wire else {
-            panic!("expected wire")
-        };
-        assert!(!text.contains("secret"));
-        // A state line holds no secret, so it is shown as OpenVPN wrote it.
-        for line in [
-            ">STATE:1700000003,CONNECTED,SUCCESS,10.8.0.6,203.0.113.5,8443",
-            "1700000003,CONNECTED,SUCCESS,10.8.0.6,203.0.113.5,8443",
-        ] {
-            let mut state = Event::Wire {
-                at: now(),
-                dir: Direction::In,
-                text: line.into(),
-            };
-            redact_test_event(&mut state, "871234", 6);
-            let Event::Wire { text, .. } = state else {
-                panic!("expected wire")
-            };
-            assert_eq!(text, line);
-        }
-        let mut challenge = "SCRV1:encoded-password:encoded-code".to_string();
-        redact_test_text(&mut challenge, "different", 6);
-        assert!(!challenge.contains("encoded-password"));
-        let mut token = "PUSH_REPLY,auth-token,unrelated-secret".to_string();
-        redact_test_text(&mut token, "different", 6);
-        assert!(!token.contains("unrelated-secret"));
     }
 
     #[test]

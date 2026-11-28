@@ -166,6 +166,33 @@ fn unpack(
     Ok(())
 }
 
+const STAGE_PREFIX: &str = ".ovpn-otp-update-";
+const RECOVERY_PREFIX: &str = ".ovpn-otp-recovery-";
+
+/// Remove staging folders a finished update left behind. On Windows the
+/// replaced program could not be deleted while it ran; it can be now.
+/// Recovery folders (backups after a failed update) are left alone.
+pub fn clean_leftovers() {
+    let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf))
+    else {
+        return;
+    };
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(STAGE_PREFIX)
+        {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
+}
+
 /// Verify and install both executables alongside the running executable.
 pub fn install(release: &Release) -> Result<PathBuf, String> {
     let (target, ext, names) = platform()?;
@@ -191,13 +218,20 @@ pub fn install(release: &Release) -> Result<PathBuf, String> {
     }
     let dir = exe.parent().ok_or("Cannot find installation folder")?;
     let stage = tempfile::Builder::new()
-        .prefix(".ovpn-otp-update-")
+        .prefix(STAGE_PREFIX)
         .tempdir_in(dir)
         .map_err(|e| format!("Cannot write to installation folder: {e}"))?;
     unpack(&archive, &root, names, stage.path(), ext)?;
     if let Err((error, recovery_failed)) = replace_pair(dir, stage.path(), names) {
         if recovery_failed {
             let kept = stage.keep();
+            let kept = match kept.file_name().and_then(|n| n.to_str()) {
+                Some(n) => {
+                    let renamed = kept.with_file_name(n.replacen(STAGE_PREFIX, RECOVERY_PREFIX, 1));
+                    fs::rename(&kept, &renamed).map(|_| renamed).unwrap_or(kept)
+                }
+                None => kept,
+            };
             return Err(format!(
                 "{error} Some files could not be restored; backups remain in {}.",
                 kept.display()

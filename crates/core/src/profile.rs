@@ -353,13 +353,6 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
     // well it would lose against that `--verb`.
     let verb = extra.iter().filter_map(|l| verb_of(l)).next_back();
     extra.retain(|l| verb_of(l).is_none());
-    // A diagnostic run must not leave an unfiltered OpenVPN log elsewhere.
-    if cfg!(feature = "diagnostic-test") {
-        extra.retain(|line| {
-            !option_line(line)
-                .is_some_and(|opt| ["log", "log-append", "syslog"].contains(&opt.name))
-        });
-    }
     let remote_override = settings.profile.remote.trim();
     let found = scan(profile, &extra);
     let skip_private = remote_override.is_empty()
@@ -425,10 +418,7 @@ pub fn prepare(profile: &str, settings: &Settings) -> Result<PreparedProfile, Pr
                     keep(&mut out);
                 }
             }
-            o if DROPPED.contains(&o)
-                || (cfg!(feature = "diagnostic-test")
-                    && ["log", "log-append", "syslog"].contains(&o)) =>
-            {
+            o if DROPPED.contains(&o) => {
                 out.push_str("# removed by ovpn-otp: ");
                 out.push_str(trimmed);
                 out.push('\n');
@@ -541,20 +531,6 @@ remote inside-a-block-is-not-an-option
 -----END CERTIFICATE-----
 </ca>
 ";
-
-    #[cfg(feature = "diagnostic-test")]
-    #[test]
-    fn diagnostic_profile_drops_unfiltered_log_destinations() {
-        let mut settings = Settings::default();
-        settings.openvpn.extra_options =
-            vec!["log-append extra.log".into(), "syslog openvpn".into()];
-        let output = prepare("client\nlog private.log\n", &settings)
-            .unwrap()
-            .text;
-        assert!(!output.lines().any(|line| line.starts_with("log ")
-            || line.starts_with("log-append ")
-            || line.starts_with("syslog ")));
-    }
 
     /// Shaped like a firewall export: a public server, then the same server
     /// by its address inside the office network.

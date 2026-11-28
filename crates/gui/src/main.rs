@@ -63,30 +63,33 @@ const SECTION_HEIGHT: f32 = 340.0;
 /// The least room such a section needs to be of use.
 const SECTION_MIN_HEIGHT: f32 = 160.0;
 
+/// Set for the copy started by "Update and restart": the old window is still
+/// shutting down and holds the lock, so this one waits for it.
+const AFTER_UPDATE_ENV: &str = "OVPN_OTP_AFTER_UPDATE";
+
+fn acquire_gui_lock(
+    rt: &RuntimeDir,
+) -> std::io::Result<Result<GuiLock, ovpn_otp_core::runtime::GuiInfo>> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let result = GuiLock::acquire(rt)?;
+        if result.is_ok()
+            || std::env::var_os(AFTER_UPDATE_ENV).is_none()
+            || std::time::Instant::now() >= deadline
+        {
+            return Ok(result);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
 fn main() -> eframe::Result {
     let requested = std::env::args_os().nth(1).map(PathBuf::from);
-    #[cfg(feature = "diagnostic-test")]
-    let requested = requested.or_else(|| {
-        std::env::current_exe()
-            .ok()?
-            .parent()
-            .map(|dir| dir.join("diagnostic-config.toml"))
-            .filter(|p| p.is_file())
-    });
-    #[cfg(feature = "diagnostic-test")]
-    if std::env::var_os(ovpn_otp_core::runtime::RUNTIME_ENV).is_none() {
-        if let Some(local) = std::env::var_os("LOCALAPPDATA") {
-            std::env::set_var(
-                ovpn_otp_core::runtime::RUNTIME_ENV,
-                PathBuf::from(local).join("ovpn-otp-test").join("run"),
-            );
-        }
-    }
     // One window at a time: two would fight over the routes and the tunnel.
     // A second start shows the window that already runs, and ends here.
     let runtime = RuntimeDir::open();
     let gui_lock = match &runtime {
-        Ok(rt) => match GuiLock::acquire(rt) {
+        Ok(rt) => match acquire_gui_lock(rt) {
             Ok(Ok(lock)) => Some(lock),
             Ok(Err(other)) => {
                 let _ = rt.request_show();
@@ -110,6 +113,10 @@ fn main() -> eframe::Result {
             None
         }
     };
+    if gui_lock.is_some() {
+        ovpn_otp_core::update::clean_leftovers();
+    }
+
     let path = settings::settings_path(requested.as_deref());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -1597,9 +1604,13 @@ impl eframe::App for App {
                         match std::env::current_exe().and_then(|exe| {
                             std::process::Command::new(exe)
                                 .args(std::env::args_os().skip(1))
+                                .env(AFTER_UPDATE_ENV, "1")
                                 .spawn()
                         }) {
-                            Ok(_) => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                            Ok(_) => {
+                                self.quitting = true;
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
                             Err(e) => {
                                 self.message =
                                     Some((true, format!("Updated, but could not restart: {e}")))
